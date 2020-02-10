@@ -6,7 +6,6 @@ import distwq
 
 logger = logging.getLogger(__name__)
 
-eval_dict = {}
 gfsopt_dict = {}
 
 
@@ -15,6 +14,7 @@ class GFSOptimizer():
         self,
         opt_id,
         obj_fun,
+        reduce_fun=None,
         problem_parameters=None,
         space=None,
         solver_epsilon=None,
@@ -162,7 +162,8 @@ class GFSOptimizer():
         self.save_iter = save_iter
 
         self.eval_fun = partial(eval_obj_fun, obj_fun, self.problem_parameters, self.params, self.is_int)
-
+        self.reduce_fun = reduce_fun
+        
         self.evals = [[] for _ in range(n_iter)]
 
     def print_best(self):
@@ -181,15 +182,20 @@ def eval_obj_fun(obj_fun, pp, space_params, is_int, i, space_vals):
     return result
 
 def gfsinit(gfsopt_params):
-    logger.info('gfsinit: %s' % pprint.pformat(gfsopt_params))
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
     if objfun_module not in sys.modules:
         importlib.import_module(objfun_module)
     objfun = eval(objfun_name, sys.modules[objfun_module].__dict__)
     gfsopt_params['obj_fun'] = objfun
+    reducefun_module = gfsopt_params.get('reduce_fun_module', '__main__')
+    reducefun_name = gfsopt_params.get('reduce_fun_name', None)
+    if reducefun_module not in sys.modules:
+        importlib.import_module(reducefun_module)
+    if reducefun_name is not None:
+        reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
+        gfsopt_params['reduce_fun'] = reducefun        
     gfsopt = GFSOptimizer(**gfsopt_params)
-    eval_dict[gfsopt.opt_id] = gfsopt.eval_fun
     gfsopt_dict[gfsopt.opt_id] = gfsopt
     return gfsopt
     
@@ -209,7 +215,12 @@ def gfsctrl(controller, gfsopt_params):
                                                    args=(gfsopt.opt_id, i, vals,)))
         for j, step_id in enumerate(step_ids):
             res = controller.get_result(step_id)
-            gfsopt.evals[i][j].set(res)
+            
+            if gfsopt.reduce_fun is None:
+                rres = res
+            else:
+                rres = gfsopt.reduce_fun(res)
+            gfsopt.evals[i][j].set(rres)
     controller.info()
 
 def gfswork(worker, gfsopt_params):
@@ -217,7 +228,7 @@ def gfswork(worker, gfsopt_params):
     gfsinit(gfsopt_params)
 
 def eval_fun(opt_id, *args):
-    return eval_dict[opt_id](*args)
+    return gfsopt_dict[opt_id].eval_fun(*args)
 
 def run(gfsopt_params, nprocs_per_worker=1, verbose=False):
     if verbose:

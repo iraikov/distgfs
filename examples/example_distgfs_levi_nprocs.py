@@ -13,6 +13,8 @@ def levi(x, y):
     c = (y - 1)**2 * (1 + math.sin(2. * math.pi * y)**2)
     return a + b + c
 
+def reduce_fun(xs):
+    return xs[0]
 
 def obj_fun(x, y, pid):
     """ Objective function to be _maximized_ by GFS. """
@@ -32,9 +34,9 @@ if __name__ == '__main__':
     # Create an optimizer parameter set
     distgfs_params = {'opt_id': 'distgfs_levi',
                       'obj_fun_name': 'obj_fun',
-                      'obj_fun_module': 'example_distgfs_levi',
+                      'obj_fun_module': 'example_distgfs_levi_nprocs',
                       'reduce_fun_name': 'reduce_fun',
-                      'reduce_fun_module': 'example_distgfs_levi',
+                      'reduce_fun_module': 'example_distgfs_levi_nprocs',
                       'problem_parameters': problem_parameters,
                       'space': space,
                       'n_iter': 20}
