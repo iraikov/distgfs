@@ -208,7 +208,8 @@ def gfsctrl(controller, gfsopt_params):
             step_ids.append(controller.submit_call("eval_fun", module_name="distgfs",
                                                    args=(gfsopt.opt_id, i, vals,)))
         for j, step_id in enumerate(step_ids):
-            gfsopt.evals[i][j].set(controller.get_result(step_id))
+            res = controller.get_result(step_id)
+            gfsopt.evals[i][j].set(res)
     controller.info()
 
 def gfswork(worker, gfsopt_params):

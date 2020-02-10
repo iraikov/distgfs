@@ -23,19 +23,21 @@ def obj_fun(x, y, pid):
     return -res
 
 
-# For this example, we pretend that we want to keep 'y' fixed at 0.5
-# while optimizing 'x' in the range -4.5 to 4.5
-space = {'x': [-4.5, 4.5]}
-problem_parameters = {'y': 0.5}
+if __name__ == '__main__':
 
-# Create an optimizer
-distgfs_params = {'opt_id': 'distgfs_beale',
-                  'obj_fun_name': 'obj_fun',
-                  'obj_fun_module': 'example_distgfs_beale',
-                  'problem_parameters': problem_parameters,
-                  'space': space,
-                  'n_iter': 10}
-
-distgfs.run(distgfs_params, verbose=True)
+    # For this example, we pretend that we want to keep 'y' fixed at 0.5
+    # while optimizing 'x' in the range -4.5 to 4.5
+    space = {'x': [-4.5, 4.5]}
+    problem_parameters = {'y': 0.5}
+    
+    # Create an optimizer
+    distgfs_params = {'opt_id': 'distgfs_beale',
+                      'obj_fun_name': 'obj_fun',
+                      'obj_fun_module': 'example_distgfs_beale',
+                      'problem_parameters': problem_parameters,
+                      'space': space,
+                      'n_iter': 10}
+    
+    distgfs.run(distgfs_params, verbose=True)
 
 

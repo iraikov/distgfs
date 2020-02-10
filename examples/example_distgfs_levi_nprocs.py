@@ -33,10 +33,12 @@ if __name__ == '__main__':
     distgfs_params = {'opt_id': 'distgfs_levi',
                       'obj_fun_name': 'obj_fun',
                       'obj_fun_module': 'example_distgfs_levi',
+                      'reduce_fun_name': 'reduce_fun',
+                      'reduce_fun_module': 'example_distgfs_levi',
                       'problem_parameters': problem_parameters,
                       'space': space,
                       'n_iter': 20}
 
-    distgfs.run(distgfs_params, verbose=True)
+    distgfs.run(distgfs_params, nprocs_per_worker=2, verbose=True)
 
 
