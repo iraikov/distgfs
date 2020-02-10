@@ -214,7 +214,6 @@ def gfsctrl(controller, gfsopt_params):
 def gfswork(worker, gfsopt_params):
     """Worker for distributed GFS optimization."""
     gfsinit(gfsopt_params)
-    worker.serve()
 
 def eval_fun(opt_id, *args):
     return eval_dict[opt_id](*args)
