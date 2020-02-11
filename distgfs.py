@@ -102,7 +102,7 @@ class DistGFSOptimizer():
         old_evals = []
         if file_path is not None:
             old_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters = \
-              init_from_file(file_path, opt_id)
+              init_from_h5(file_path, param_names, opt_id)
         eps = 0.0005 if eps is None else eps
         noise_mag = 0.001 if noise_mag is None else noise_mag
         spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_int)
@@ -131,43 +131,112 @@ class DistGFSOptimizer():
         
         self.evals = [[] for _ in range(n_iter)]
 
-        self.file_path = file_path
-        
+
+    def save_evals(self):
+        """Store results of finished evals to file; print best eval"""
+        finished_evals = self.optimizer.get_function_evaluations()[1][0]
+        save_to_h5(self.spec, finished_evals, self.param_names, self.eps, self.noise_mag, self.problem_parameters,
+                   self.fname)
+        logger.info(f"Saving {len(finished_evals)} trials to {self.fname}.")
+        self.print_best()
         
     def print_best(self):
         best_eval = self.optimizer.get_best_function_eval()
         prms = list(zip(self.param_names, list(best_eval[0])))
         res = best_eval[1]
-        print(f"Best eval so far: {res}@{prms}")
+        logger.info(f"Best eval so far: {res}@{prms}")
 
-def init_h5types(input_file):
-    dt = np.dtype([("is_integer", np.bool),
+def h5_get_group (h, groupname):
+    if groupname in h.keys():
+        g = h[groupname]
+    else:
+        g = h.create_group(groupname)
+    return g
+
+def h5_get_dataset (g, dsetname, **kwargs):
+    if dsetname in g.keys():
+        dset = g[dsetname]
+    else:
+        dset = g.create_dataset(dsetname, (0,), **kwargs)
+    return dset
+
+
+def h5_init_types(f, opt_id, problem_parameters, space):
+    
+    opt_grp = h5_get_group(f, opt_id)
+
+    # create an HDF5 enumerated type for the parameter label
+    param_mapping = { name: idx for (idx, name) in
+                      enumerate(sorted(problem_parameters.keys())) }
+    dt = h5py.special_dtype(enum=(np.uint16, param_mapping))
+    opt_grp['parameter_enum'] = dt
+
+    dt = np.dtype([("parameter", opt_grp['parameter_enum'].dtype)
+                   ("value", np.float32)])
+    opt_grp['problem_parameters_type'] = dt
+
+    dset = h5_get_dataset(g, 'problem_parameters', maxshape=(len(param_mapping),),
+                          dtype=opt_grp['problem_parameters_type'].dtype)
+    dset.resize((len(param_mapping),))
+    a = np.zeros(len(param_mapping), dtype=opt_grp['problem_parameters_type'].dtype)
+    idx = 0
+    for parm, val in problem_parameters.items():
+        a[idx]["parameter"] = param_mapping[parm]
+        a[idx]["value"] = val
+    
+    dt = np.dtype([("parameter", opt_grp['parameter_enum'].dtype)
+                   ("is_integer", np.bool),
                    ("lower", np.float32),
                    ("upper", np.float32)])
-    ## TODO
+    opt_grp['parameter_spec_type'] = dt
 
+    dset = h5_get_dataset(g, 'parameter_spec', maxshape=(len(space),),
+                          dtype=opt_grp['parameter_spec_type'].dtype)
+    dset.resize((len(space),))
+    a = np.zeros(len(space), dtype=opt_grp['parameter_spec_type'].dtype)
+    idx = 0
+    for parm, conf in space.items():
+        lo, hi = conf
+        is_int = (type(lo) == int) and (type(hi) == int)
+        a[idx]["parameter"] = param_mapping[parm]
+        a[idx]["is_integer"] = is_int
+        a[idx]["lower"] = lo
+        a[idx]["upper"] = hi
     
-def load_raw(input_file, opt_id):
+    
+def h5_load_raw(input_file, opt_id):
     ## N is number of trials
     ## M is number of hyperparameters
     f = h5py.File(input_file, 'r')
-    opt_grp = f[opt_id]
+    opt_grp = h5_get_group(f, opt_id)
     raw_results = opt_grp['results'] # np.array of shape [N, M+1]
     solver_epsilon = opt_grp['solver_epsilon']
     relative_noise_magnitude = opt_grp['relative_noise_magnitude']
-    dt = opt_grp['param_type']
-    problem_parameters = opt_grp['problem_parameters']
-    is_integer = opt_grp['is_integer'] # array of length M
-    lower = opt_grp['lower'] # array of length M
-    upper = opt_grp['upper'] # array of length M
 
-    ## TODO: convert structures to appropriate arrays
+    problem_parameters_idx_dict = { parm: idx for parm, idx in opt_grp['problem_parameters_enum'] }
+    problem_parameters_name_dict = { idx: parm for parm, idx in problem_parameters_idx_dict.items() }
+    problem_parameters_dict = { problem_parameters_name_dict[idx]: val for idx, val in opt_grp['problem_parameters'] }
+    parameter_spec_dict = { problem_parameters_name_dict[idx]: spec for idx, spec in opt_grp['parameter_spec'] }
+    f.close()
+    
+    param_names = []
+    is_integer = []
+    lower = []
+    upper = []
+    problem_parameters = {}
+    for parm, idx in problem_parameters_idx_dict:
+        param_names.append(parm)
+        problem_parameters[parm] = problem_parameters_dict[parm]
+        is_int, lo, hi = parameter_spec_dict[parm]
+        is_integer.append(is_int)
+        is_integer.append(lo)
+        is_integer.append(hi)
     
     raw_spec = (is_integer, lower, upper)
     info = (params, solver_epsilon, relative_noise_magnitude, problem_parameters)
     return raw_spec, raw_results, info
 
-def load_all(file_path, opt_id):
+def h5_load_all(file_path, opt_id):
     """
     Loads an HDF5 file containing
     (spec, results, info) where
@@ -195,44 +264,61 @@ def load_all(file_path, opt_id):
         result = dlib.function_evaluation(x=x, y=raw_result[0])
         evals.append(result)
     return raw_spec, spec, evals, info, prev_best
-
-
-def init_from_file(file_path, opt_id):        
+    
+def init_from_h5(self, file_path, param_names, opt_id):        
     # Load progress and settings from file, then compare each
     # restored setting with settings specified by args (if any)
-    old_raw_spec, old_spec, old_evals, info, prev_best = load_all(file_path, opt_id)
+    old_raw_spec, old_spec, old_evals, info, prev_best = h5_load_all(file_path, opt_id)
     saved_params = info['params']
     logger.info(
         f"Restored {len(old_evals)} trials, prev best: "
         f"{prev_best[0]}@{list(zip(saved_params, prev_best[1:]))}"
         )
-    if params and params != saved_params:
+    if (params is not None) and params != saved_params:
         # Switching params being optimized over would throw off Dlib.
         # Must use restore params from specified
-        logger.info(
+        logger.warning(
             f"Saved params {saved_params} differ from currently specified "
             f"{params}. Using saved."
             )
     params = saved_params
-    if is_int:
-        raw_spec = _cmp_and_choose(
-            'bounds', old_raw_spec, (is_int, lo_bounds, hi_bounds)
-            )
-    else:
-        raw_spec = old_raw_spec
+    raw_spec = old_raw_spec
     is_int, lo_bounds, hi_bounds = raw_spec
     if len(params) != len(is_int):
         raise ValueError(
             f"Params {params} and spec {raw_spec} are of different length"
             )
-    eps = _cmp_and_choose('solver_epsilon', info['solver_epsilon'], eps)
-    noise_mag = _cmp_and_choose(
-        'relative_noise_magnitude', info['relative_noise_magnitude'],
-        noise_mag
-        )
-    _, problem_parameters = _compare_pps(info['problem_parameters'], problem_parameters)
-    return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters
+    eps = info['solver_epsilon']
+    noise_mag = info['relative_noise_magnitude']
+    problem_parameters = info['problem_parameters']
     
+    return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters
+
+def save_to_h5(opt_id, spec, evals, params, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath):
+    """
+    Save progress and settings to an HDF5 file 'fpath'.
+    """
+    raw_results = np.zeros((len(evals), len(evals[0].x) + 1))
+    for i, eeval in enumerate(evals):
+        raw_results[i][0] = eeval.y
+        raw_results[i][1:] = list(eeval.x)
+
+    f = h5py.File(fpath, "a")
+    if opt_id not in h.keys():
+        h5_init_types(f, opt_id, problem_parameters, space)
+
+    opt_grp = h5_get_group(f, opt_id)
+    opt_grp['results'] = raw_results
+    opt_grp['params'] = params
+    opt_grp['solver_epsilon'] = solver_epsilon
+    opt_grp['relative_noise_magnitude'] = relative_noise_magnitude
+    opt_grp['problem_parameters'] = problem_parameters
+
+    opt_grp['is_integer'] = np.asarray(spec.is_integer_variable, dtype=np.bool)
+    opt_grp['upper'] = np.asarray(spec.upper, dtype=np.float32)
+    opt_grp['lower'] = np.asarray(spec.lower, dtype=np.float32)
+            
+    f.close()
         
 def eval_obj_fun(obj_fun, pp, space_params, is_int, i, space_vals):
     """
