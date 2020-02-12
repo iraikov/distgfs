@@ -141,11 +141,15 @@ class DistGFSOptimizer():
         finished_evals = self.optimizer.get_function_evaluations()[1][0]
         save_to_h5(self.opt_id, self.param_names, self.spec, finished_evals, 
                    self.eps, self.noise_mag, self.problem_parameters, self.file_path)
-        
-    def print_best(self):
+
+    def get_best(self):
         best_eval = self.optimizer.get_best_function_eval()
         prms = list(zip(self.param_names, list(best_eval[0])))
         res = best_eval[1]
+        return prms, res
+        
+    def print_best(self):
+        prms, res = self.get_best()
         logger.info(f"Best eval so far: {res}@{prms}")
 
 def h5_get_group (h, groupname):
@@ -391,8 +395,10 @@ def gfsctrl(controller, gfsopt_params):
                 rres = res
             else:
                 rres = gfsopt.reduce_fun(res)
+            print(rres)
             gfsopt.evals[i][j].set(rres)
-    gfsopt.save_evals()
+    if gfsopt.save:
+        gfsopt.save_evals()
     controller.info()
 
 def gfswork(worker, gfsopt_params):
@@ -402,7 +408,7 @@ def gfswork(worker, gfsopt_params):
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
 
-def run(gfsopt_params, nprocs_per_worker=1, verbose=False):
+def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
     if verbose:
         logging.basicConfig(level=logging.INFO)
     else:
@@ -410,12 +416,17 @@ def run(gfsopt_params, nprocs_per_worker=1, verbose=False):
     
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
-                   verbose=True, args=(gfsopt_params,), nprocs_per_worker=nprocs_per_worker)
+                   verbose=True, args=(gfsopt_params,),
+                   spawn_workers=spawn_workers,
+                   nprocs_per_worker=nprocs_per_worker)
         opt_id = gfsopt_params['opt_id']
         gfsopt = gfsopt_dict[opt_id]
         gfsopt.print_best()
+        return gfsopt.get_best()
     else:
         distwq.run(fun_name="gfswork", module_name="distgfs",
-                   verbose=True, args=(gfsopt_params,), nprocs_per_worker=nprocs_per_worker)
+                   verbose=True, args=(gfsopt_params,),
+                   spawn_workers=spawn_workers,
+                   nprocs_per_worker=nprocs_per_worker)
 
 
