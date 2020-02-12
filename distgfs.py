@@ -58,10 +58,8 @@ class DistGFSOptimizer():
             simply negate the result in the objective function before returning it.
         :param int n_iter: (optional) Number of times to sample and test params.
         :param int save_iter: (optional) How often to save progress.
-        :param str file_path: File name for restoring and/or saving results,
-            progress and settings.
-        :param bool save: (optional) Save settings and progress periodically,
-            on user quit (CTRL-C), and on completion.
+        :param str file_path: (optional) File name for restoring and/or saving results and settings.
+        :param bool save: (optional) Save settings and progress periodically.
         :param float solver_epsilon: (optional) The accuracy to which local optima
             are determined before global exploration is resumed.
             See `Dlib <http://dlib.net/dlib/global_optimization/
@@ -376,7 +374,7 @@ def gfsctrl(controller, gfsopt_params):
     logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
     n_steps = distwq.n_workers if distwq.workers_available else 1
     for i in range(0, gfsopt.n_iter):
-        if (i > 0) and (i % gfsopt.save_iter == 0):
+        if (i > 0) and gfsopt.save and (i % gfsopt.save_iter == 0):
             gfsopt.save_evals()
         step_ids = []
         for j in range(0, n_steps):

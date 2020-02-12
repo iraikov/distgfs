@@ -36,7 +36,8 @@ if __name__ == '__main__':
                       'problem_parameters': problem_parameters,
                       'space': space,
                       'n_iter': 10,
-                      'file_path': 'distgfs.levi.h5'
+                      'file_path': 'distgfs.levi.h5',
+                      'save': True
                       }
 
     distgfs.run(distgfs_params, verbose=True)
