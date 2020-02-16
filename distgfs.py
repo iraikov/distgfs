@@ -355,11 +355,26 @@ def eval_obj_fun(obj_fun, pp, space_params, is_int, i, space_vals):
     return result
 
 def gfsinit(gfsopt_params):
+    objfun = None
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
-    if objfun_module not in sys.modules:
-        importlib.import_module(objfun_module)
-    objfun = eval(objfun_name, sys.modules[objfun_module].__dict__)
+    if distwq.is_worker:
+        if objfun_name is not None:
+            if objfun_module not in sys.modules:
+                importlib.import_module(objfun_module)
+                
+            objfun = eval(objfun_name, sys.modules[objfun_module].__dict__)
+        else:
+            objfun_init_module = gfsopt_params.get('obj_fun_init_module', '__main__')
+            objfun_init_name = gfsopt_params.get('obj_fun_init_name', None)
+            objfun_init_args = gfsopt_params.get('obj_fun_init_args', None)
+            if objfun_init_name is None:
+                raise RuntimeError("distgfs.gfsinit: objfun is not provided")
+            if objfun_init_module not in sys.modules:
+                importlib.import_module(objfun_init_module)
+            objfun_init = eval(objfun_init_name, sys.modules[objfun_init_module].__dict__)
+            objfun = objfun_init(**objfun_init_args)
+            
     gfsopt_params['obj_fun'] = objfun
     reducefun_module = gfsopt_params.get('reduce_fun_module', '__main__')
     reducefun_name = gfsopt_params.get('reduce_fun_name', None)
