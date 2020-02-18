@@ -177,9 +177,11 @@ def h5_init_types(f, opt_id, param_names, problem_parameters, spec):
     
     opt_grp = h5_get_group(f, opt_id)
 
+    param_keys = set(param_names)
+    param_keys.update(problem_parameters.keys())
     # create an HDF5 enumerated type for the parameter label
     param_mapping = { name: idx for (idx, name) in
-                      enumerate(sorted(problem_parameters.keys())) }
+                      enumerate(param_keys) }
 
     dt = h5py.enum_dtype(param_mapping, basetype=np.uint16)
     opt_grp['parameter_enum'] = dt
@@ -410,7 +412,6 @@ def gfsctrl(controller, gfsopt_params):
                 rres = res
             else:
                 rres = gfsopt.reduce_fun(res)
-            print(rres)
             gfsopt.evals[i][j].set(rres)
     if gfsopt.save:
         gfsopt.save_evals()
