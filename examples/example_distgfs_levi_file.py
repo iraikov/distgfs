@@ -14,7 +14,7 @@ def levi(x, y):
     return a + b + c
 
 
-def obj_fun(x, y, pid):
+def obj_fun(x, y, z, pid):
     """ Objective function to be _maximized_ by GFS. """
     res = levi(x, y)
     logger.info(f"Iter: {pid}\t x:{x}, y:{y}, result:{res}")
@@ -26,13 +26,13 @@ if __name__ == '__main__':
 
     # For this example, we pretend that we want to keep 'y' fixed at 1.0
     # while optimizing 'x' in the range -4.5 to 4.5
-    space = {'x': [-4.5, 4.5]}
+    space = {'x': [-4.5, 4.5], 'z': [-1.0, 1.0]}
     problem_parameters = {'y': 1.}
     
     # Create an optimizer parameter set
     distgfs_params = {'opt_id': 'distgfs_levi',
                       'obj_fun_name': 'obj_fun',
-                      'obj_fun_module': 'example_distgfs_levi',
+                      'obj_fun_module': 'example_distgfs_levi_file',
                       'problem_parameters': problem_parameters,
                       'space': space,
                       'n_iter': 10,

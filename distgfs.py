@@ -209,13 +209,12 @@ def h5_init_types(f, opt_id, param_names, problem_parameters, spec):
     is_integer = np.asarray(spec.is_integer_variable, dtype=np.bool)
     upper = np.asarray(spec.upper, dtype=np.float32)
     lower = np.asarray(spec.lower, dtype=np.float32)
-    
+
     dset = h5_get_dataset(opt_grp, 'parameter_spec', maxshape=(len(param_names),),
                           dtype=opt_grp['parameter_spec_type'].dtype)
     dset.resize((len(param_names),))
     a = np.zeros(len(param_names), dtype=opt_grp['parameter_spec_type'].dtype)
-    idx = 0
-    for parm, is_int, hi, lo in zip(param_names, is_integer, upper, lower):
+    for idx, (parm, is_int, hi, lo) in enumerate(zip(param_names, is_integer, upper, lower)):
         a[idx]["parameter"] = param_mapping[parm]
         a[idx]["is_integer"] = is_int
         a[idx]["lower"] = lo
@@ -406,7 +405,7 @@ def gfsctrl(controller, gfsopt_params):
             step_ids.append(controller.submit_call("eval_fun", module_name="distgfs",
                                                    args=(gfsopt.opt_id, i, vals,)))
         for j, step_id in enumerate(step_ids):
-            res = controller.get_result(step_id)
+            task_id, res = controller.get_result(step_id)
             
             if gfsopt.reduce_fun is None:
                 rres = res
