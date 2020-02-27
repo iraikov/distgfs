@@ -401,7 +401,6 @@ def gfsctrl(controller, gfsopt_params):
             eval_req = gfsopt.optimizer.get_next_x()
             gfsopt.evals[i].append(eval_req)
             vals = list(eval_req.x)
-            logger.info("optimization iteration %d: evaluating parameter coordinates %s" % (i, vals))
             step_ids.append(controller.submit_call("eval_fun", module_name="distgfs",
                                                    args=(gfsopt.opt_id, i, vals,)))
         for j, step_id in enumerate(step_ids):
@@ -411,7 +410,10 @@ def gfsctrl(controller, gfsopt_params):
                 rres = res
             else:
                 rres = gfsopt.reduce_fun(res)
-            gfsopt.evals[i][j].set(rres)
+            eval_req = gfsopt.evals[i][j]
+            vals = list(eval_req.x)
+            logger.info("optimization iteration %d: parameter coordinates %s: %s" % (i, str(vals), str(rres)))
+            eval_req.set(rres)
     if gfsopt.save:
         gfsopt.save_evals()
     controller.info()
