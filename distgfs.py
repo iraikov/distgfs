@@ -24,6 +24,7 @@ class DistGFSOptimizer():
         solver_epsilon=None,
         relative_noise_magnitude=None,
         n_iter=100,
+        n_pareval=None,
         nprocs_per_worker=1,
         save_iter=10,
         file_path=None,
@@ -57,6 +58,7 @@ class DistGFSOptimizer():
             If you want to minimize instead,
             simply negate the result in the objective function before returning it.
         :param int n_iter: (optional) Number of times to sample and test params.
+        :param int n_pareval: (optional) Number of parallel evaluations (default is number of workers)
         :param int save_iter: (optional) How often to save progress.
         :param str file_path: (optional) File name for restoring and/or saving results and settings.
         :param bool save: (optional) Save settings and progress periodically.
@@ -128,12 +130,17 @@ class DistGFSOptimizer():
         self.file_path, self.save = file_path, save
 
         self.n_iter = n_iter
+        if (n_pareval is None) or (n_pareval < 0) or (n_pareval > distwq.n_workers):
+            self.n_pareval = distwq.n_workers if distwq.workers_available else 1
+        else:
+            self.n_pareval = n_pareval
+            
         self.save_iter = save_iter
 
         self.eval_fun = partial(eval_obj_fun, obj_fun, self.problem_parameters, self.param_names, self.is_int)
         self.reduce_fun = reduce_fun
         
-        self.evals = [[] for _ in range(n_iter)]
+        self.evals = {}
 
 
     def save_evals(self):
@@ -392,28 +399,34 @@ def gfsctrl(controller, gfsopt_params):
     """Controller for distributed GFS optimization."""
     gfsopt = gfsinit(gfsopt_params)
     logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
-    n_steps = distwq.n_workers if distwq.workers_available else 1
-    for i in range(0, gfsopt.n_iter):
-        if (i > 0) and gfsopt.save and (i % gfsopt.save_iter == 0):
+    iter_count = 0
+    task_ids = []
+    while iter_count < gfsopt.n_iter:
+        if (iter_count > 0) and gfsopt.save and (iter_count % gfsopt.save_iter == 0):
             gfsopt.save_evals()
-        step_ids = []
-        for j in range(0, n_steps):
-            eval_req = gfsopt.optimizer.get_next_x()
-            gfsopt.evals[i].append(eval_req)
-            vals = list(eval_req.x)
-            step_ids.append(controller.submit_call("eval_fun", module_name="distgfs",
-                                                   args=(gfsopt.opt_id, i, vals,)))
-        for j, step_id in enumerate(step_ids):
-            task_id, res = controller.get_result(step_id)
+
+        if len(task_ids) > 0:
+            task_id, res = controller.get_next_result()
             
             if gfsopt.reduce_fun is None:
                 rres = res
             else:
                 rres = gfsopt.reduce_fun(res)
-            eval_req = gfsopt.evals[i][j]
+            eval_req = gfsopt.evals[task_id]
             vals = list(eval_req.x)
-            logger.info("optimization iteration %d: parameter coordinates %s: %s" % (i, str(vals), str(rres)))
             eval_req.set(rres)
+            task_ids.remove(task_id)
+            iter_count += 1
+            logger.info("optimization iteration %d: parameter coordinates %s: %s" % (iter_count, str(vals), str(rres)))
+            
+        while len(task_ids) < gfsopt.n_pareval and len(gfsopt.evals) < gfsopt.n_iter:
+            eval_req = gfsopt.optimizer.get_next_x()
+            vals = list(eval_req.x)
+            task_id = controller.submit_call("eval_fun", module_name="distgfs",
+                                             args=(gfsopt.opt_id, iter_count, vals,))
+            task_ids.append(task_id)
+            gfsopt.evals[task_id] = eval_req
+                
     if gfsopt.save:
         gfsopt.save_evals()
     controller.info()
