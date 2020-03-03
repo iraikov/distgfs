@@ -24,7 +24,6 @@ class DistGFSOptimizer():
         solver_epsilon=None,
         relative_noise_magnitude=None,
         n_iter=100,
-        n_pareval=None,
         nprocs_per_worker=1,
         save_iter=10,
         file_path=None,
@@ -58,7 +57,6 @@ class DistGFSOptimizer():
             If you want to minimize instead,
             simply negate the result in the objective function before returning it.
         :param int n_iter: (optional) Number of times to sample and test params.
-        :param int n_pareval: (optional) Number of parallel evaluations (default is number of workers)
         :param int save_iter: (optional) How often to save progress.
         :param str file_path: (optional) File name for restoring and/or saving results and settings.
         :param bool save: (optional) Save settings and progress periodically.
@@ -130,10 +128,6 @@ class DistGFSOptimizer():
         self.file_path, self.save = file_path, save
 
         self.n_iter = n_iter
-        if (n_pareval is None) or (n_pareval < 0) or (n_pareval > distwq.n_workers):
-            self.n_pareval = distwq.n_workers if distwq.workers_available else 1
-        else:
-            self.n_pareval = n_pareval
             
         self.save_iter = save_iter
 
@@ -402,6 +396,8 @@ def gfsctrl(controller, gfsopt_params):
     iter_count = 0
     task_ids = []
     while iter_count < gfsopt.n_iter:
+        controller.recv()
+        
         if (iter_count > 0) and gfsopt.save and (iter_count % gfsopt.save_iter == 0):
             gfsopt.save_evals()
 
@@ -419,7 +415,7 @@ def gfsctrl(controller, gfsopt_params):
             iter_count += 1
             logger.info("optimization iteration %d: parameter coordinates %s: %s" % (iter_count, str(vals), str(rres)))
             
-        while len(task_ids) < gfsopt.n_pareval and len(gfsopt.evals) < gfsopt.n_iter:
+        while (len(controller.ready_workers) > 0) and (len(gfsopt.evals) < gfsopt.n_iter):
             eval_req = gfsopt.optimizer.get_next_x()
             vals = list(eval_req.x)
             task_id = controller.submit_call("eval_fun", module_name="distgfs",
