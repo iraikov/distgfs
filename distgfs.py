@@ -118,9 +118,9 @@ class DistGFSOptimizer():
             )
         else:
             optimizer = dlib.global_function_search(
-                [spec]
+                [spec],
+                relative_noise_magnitude=noise_mag
             )
-            optimizer.set_relative_noise_magnitude(noise_mag)
         optimizer.set_solver_epsilon(eps)
 
         self.problem_parameters, self.param_names, self.optimizer, self.spec = problem_parameters, param_names, optimizer, spec
