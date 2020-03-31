@@ -356,11 +356,12 @@ def eval_obj_fun(obj_fun, pp, space_params, is_int, i, space_vals):
     result = obj_fun(**pp, pid=i)
     return result
 
-def gfsinit(gfsopt_params):
+def gfsinit(gfsopt_params, worker_id=None):
     objfun = None
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
     if distwq.is_worker:
+        assert (worker_id is not None)
         if objfun_name is not None:
             if objfun_module not in sys.modules:
                 importlib.import_module(objfun_module)
@@ -375,7 +376,7 @@ def gfsinit(gfsopt_params):
             if objfun_init_module not in sys.modules:
                 importlib.import_module(objfun_init_module)
             objfun_init = eval(objfun_init_name, sys.modules[objfun_init_module].__dict__)
-            objfun = objfun_init(**objfun_init_args)
+            objfun = objfun_init(**objfun_init_args, worker_id=worker_id)
             
     gfsopt_params['obj_fun'] = objfun
     reducefun_module = gfsopt_params.get('reduce_fun_module', '__main__')
@@ -429,7 +430,7 @@ def gfsctrl(controller, gfsopt_params):
 
 def gfswork(worker, gfsopt_params):
     """Worker for distributed GFS optimization."""
-    gfsinit(gfsopt_params)
+    gfsinit(gfsopt_params, worker_id=worker.worker_id)
 
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
