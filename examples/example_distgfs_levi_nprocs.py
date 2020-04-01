@@ -41,6 +41,6 @@ if __name__ == '__main__':
                       'space': space,
                       'n_iter': 20}
 
-    distgfs.run(distgfs_params, nprocs_per_worker=2, verbose=True)
+    distgfs.run(distgfs_params, nprocs_per_worker=1, spawn_workers=True, verbose=True)
 
 
