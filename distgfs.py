@@ -1,4 +1,4 @@
-import os, sys, importlib, logging, pprint
+import os, sys, importlib, logging, pprint, copy
 from functools import partial
 import numpy as np  
 import dlib
@@ -19,6 +19,7 @@ class DistGFSOptimizer():
         opt_id,
         obj_fun,
         reduce_fun=None,
+        problem_ids=None,
         problem_parameters=None,
         space=None,
         solver_epsilon=None,
@@ -36,6 +37,10 @@ class DistGFSOptimizer():
         (GFS) optimizer in dlib. Supports distributed optimization
         runs via mpi4py. Based on GFSOPtimizer by https://github.com/tsoernes
 
+        :param set problem_ids (optional): Set of problem ids.
+            For solving sets of related problems with the same set of parameters.
+            If this parameter is not None, it is expected that the objective function 
+            will return a dictionary of the form { problem_id: value }
         :param dict problem_parameters: Problem parameters.
             All hyperparameters and their values for the objective
             function, including those not being optimized over. E.g: ``{'beta': 0.44}``.
@@ -74,6 +79,7 @@ class DistGFSOptimizer():
         """
 
         self.opt_id = opt_id
+            
         
         # Verify inputs
         if file_path is None:
@@ -101,29 +107,38 @@ class DistGFSOptimizer():
                 is_int.append(type(lo) == int and type(hi) == int)
                 lo_bounds.append(lo)
                 hi_bounds.append(hi)
-        old_evals = []
+        old_evals = {}
         if file_path is not None:
             if os.path.isfile(file_path):
-                old_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters = \
+                old_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids = \
                   init_from_h5(file_path, param_names, opt_id)
         eps = 0.0005 if eps is None else eps
         noise_mag = 0.001 if noise_mag is None else noise_mag
         spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_int)
 
-        if len(old_evals) > 0:
-            optimizer = dlib.global_function_search(
-                [spec],
-                initial_function_evals=[old_evals],
-                relative_noise_magnitude=noise_mag
-            )
-        else:
-            optimizer = dlib.global_function_search(
-                [spec],
-                relative_noise_magnitude=noise_mag
-            )
-        optimizer.set_solver_epsilon(eps)
-
-        self.problem_parameters, self.param_names, self.optimizer, self.spec = problem_parameters, param_names, optimizer, spec
+        has_problem_ids = (problem_ids is not None)
+        if not has_problem_ids:
+            problem_ids = set([0])
+        
+        optimizer_dict = {}
+        for problem_id in problem_ids:
+            if problem_id in old_evals:
+                optimizer = dlib.global_function_search(
+                    [spec],
+                    initial_function_evals=[old_evals[problem_id]],
+                    relative_noise_magnitude=noise_mag
+                )
+            else:
+                optimizer = dlib.global_function_search(
+                    [spec]
+                )
+                optimizer.set_relative_noise_magnitude(noise_mag)
+            optimizer.set_solver_epsilon(eps)
+            optimizer_dict[problem_id] = optimizer
+        
+        self.optimizer_dict = optimizer_dict
+        
+        self.problem_parameters, self.param_names, self.spec = problem_parameters, param_names, spec
         self.eps, self.noise_mag, self.is_int = eps, noise_mag, is_int
         self.file_path, self.save = file_path, save
 
@@ -131,27 +146,48 @@ class DistGFSOptimizer():
             
         self.save_iter = save_iter
 
-        self.eval_fun = partial(eval_obj_fun, obj_fun, self.problem_parameters, self.param_names, self.is_int)
+        if has_problem_ids:
+            self.eval_fun = partial(eval_obj_fun_mp, obj_fun, self.problem_parameters, self.param_names, self.is_int, problem_ids)
+        else:
+            self.eval_fun = partial(eval_obj_fun_sp, obj_fun, self.problem_parameters, self.param_names, self.is_int, 0)
+            
         self.reduce_fun = reduce_fun
         
-        self.evals = {}
+        self.evals = { problem_id: {} for problem_id in problem_ids }
 
+        self.has_problem_ids = has_problem_ids
+        self.problem_ids = problem_ids
 
     def save_evals(self):
         """Store results of finished evals to file; print best eval"""
-        finished_evals = self.optimizer.get_function_evaluations()[1][0]
-        save_to_h5(self.opt_id, self.param_names, self.spec, finished_evals, 
+        finished_evals = { problem_id: self.optimizer_dict[problem_id].get_function_evaluations()[1][0]
+                           for problem_id in self.problem_ids }
+        save_to_h5(self.opt_id, self.problem_ids, self.has_problem_ids,
+                   self.param_names, self.spec, finished_evals, 
                    self.eps, self.noise_mag, self.problem_parameters, self.file_path)
 
     def get_best(self):
-        best_eval = self.optimizer.get_best_function_eval()
-        prms = list(zip(self.param_names, list(best_eval[0])))
-        res = best_eval[1]
-        return prms, res
+        best_results = {}
+        for problem_id in self.problem_ids:
+            best_eval = self.optimizer_dict[problem_id].get_best_function_eval()
+            prms = list(zip(self.param_names, list(best_eval[0])))
+            res = best_eval[1]
+            best_results[problem_id] = (prms, res)
+        if self.has_problem_ids:
+            return best_results
+        else:
+            return best_results[problem_id]
         
     def print_best(self):
-        prms, res = self.get_best()
-        logger.info(f"Best eval so far: {res}@{prms}")
+        best_results = self.get_best()
+        if self.has_problem_ids:
+            for problem_id in self.problem_ids:
+                res, prms = best_results[problem_id]
+                logger.info(f"Best eval so far for id {problem_id}: {res}@{prms}")
+        else:
+            res, prms = best_results
+            logger.info(f"Best eval so far for: {res}@{prms}")
+            
 
 def h5_get_group (h, groupname):
     if groupname in h.keys():
@@ -238,9 +274,18 @@ def h5_load_raw(input_file, opt_id):
                            for idx, val in opt_grp['problem_parameters'] }
     parameter_spec_dict = { parameters_name_dict[spec[0]]: tuple(spec)[1:] 
                             for spec in iter(opt_grp['parameter_spec']) }
+
+    problem_ids = None
+    if 'problem_ids' in opt_grp:
+        problem_ids = set(opt_grp['problem_ids'])
     
     M = len(parameter_spec_dict)
-    raw_results = opt_grp['results'][:].reshape((-1,M+1)) # np.array of shape [N, M+1]
+    raw_results = {}
+    if problem_ids is not None:
+        for problem_id in problem_ids:
+            raw_results[problem_id] = opt_grp['%d' % problem_id]['results'][:].reshape((-1,M+1)) # np.array of shape [N, M+1]
+    else:
+        raw_results[0] = opt_grp['%d' % 0]['results'][:].reshape((-1,M+1)) # np.array of shape [N, M+1]
     f.close()
     
     param_names = []
@@ -259,7 +304,9 @@ def h5_load_raw(input_file, opt_id):
     info = { 'params': param_names,
              'solver_epsilon': solver_epsilon,
              'relative_noise_magnitude': relative_noise_magnitude,
-             'problem_parameters': problem_parameters }
+             'problem_parameters': problem_parameters,
+             'problem_ids': problem_ids }
+    
     return raw_spec, raw_results, info
 
 def h5_load_all(file_path, opt_id):
@@ -280,25 +327,30 @@ def h5_load_all(file_path, opt_id):
     (dlib.function_spec, [dlib.function_eval], dict, prev_best)
       where prev_best: np.array[result, param1, param2, ...]
     """
-    raw_spec, raw_results, info = h5_load_raw(file_path, opt_id)
+    raw_spec, raw_problem_results, info = h5_load_raw(file_path, opt_id)
     is_integer, lo_bounds, hi_bounds = raw_spec
     spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_integer)
-    evals = []
-    prev_best = raw_results[np.argmax(raw_results, axis=0)[0]]
-    for raw_result in raw_results:
-        x = list(raw_result[1:])
-        result = dlib.function_evaluation(x=x, y=raw_result[0])
-        evals.append(result)
-    return raw_spec, spec, evals, info, prev_best
+    evals = { problem_id: [] for problem_id in raw_problem_results }
+    prev_best_dict = {}
+    for problem_id in raw_problem_results:
+        raw_results = raw_problem_results[problem_id]
+        prev_best_dict[problem_id] = raw_results[np.argmax(raw_results, axis=0)[0]]
+        for raw_result in raw_results:
+            x = list(raw_result[1:])
+            result = dlib.function_evaluation(x=x, y=raw_result[0])
+            evals[problem_id].append(result)
+    return raw_spec, spec, evals, info, prev_best_dict
     
 def init_from_h5(file_path, param_names, opt_id):        
     # Load progress and settings from file, then compare each
     # restored setting with settings specified by args (if any)
     old_raw_spec, old_spec, old_evals, info, prev_best = h5_load_all(file_path, opt_id)
     saved_params = info['params']
-    logger.info(
-        f"Restored {len(old_evals)} trials, prev best: "
-        f"{prev_best[0]}@{list(zip(saved_params, prev_best[1:]))}"
+    for problem_id in old_evals:
+        n_old_evals = len(old_evals[problem_id])
+        logger.info(
+            f"Restored {n_old_evals} trials, prev best: "
+            f"{prev_best[problem_id][0]}@{list(zip(saved_params, prev_best[problem_id][1:]))}"
         )
     if (param_names is not None) and param_names != saved_params:
         # Switching params being optimized over would throw off Dlib.
@@ -317,10 +369,11 @@ def init_from_h5(file_path, param_names, opt_id):
     eps = info['solver_epsilon']
     noise_mag = info['relative_noise_magnitude']
     problem_parameters = info['problem_parameters']
+    problem_ids = info['problem_ids'] if 'problem_ids' in info else None
 
-    return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters
+    return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids
 
-def save_to_h5(opt_id, param_names, spec, evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath):
+def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath):
     """
     Save progress and settings to an HDF5 file 'fpath'.
     """
@@ -331,37 +384,64 @@ def save_to_h5(opt_id, param_names, spec, evals, solver_epsilon, relative_noise_
         opt_grp = h5_get_group(f, opt_id)
         opt_grp['solver_epsilon'] = solver_epsilon
         opt_grp['relative_noise_magnitude'] = relative_noise_magnitude
-        dset = h5_get_dataset(opt_grp, 'results', dtype=np.float32, 
-                              maxshape=(None,), compression=6)
+        if has_problem_ids:
+            opt_grp['problem_ids'] = np.asarray(list(problem_ids), dtype=np.int32)
 
     opt_grp = h5_get_group(f, opt_id)
     M = len(param_names)
-    old_size = int(opt_grp['results'].shape[0] / (M+1))
-    raw_results = np.zeros((len(evals)-old_size, len(evals[0].x) + 1))
-    for i, eeval in enumerate(evals[old_size:]):
-        raw_results[i][0] = eeval.y
-        raw_results[i][1:] = list(eeval.x)
-    logger.info(f"Saving {raw_results.shape[0]} trials to {fpath}.")
-    
-    h5_concat_dataset(opt_grp['results'], raw_results.ravel())
+    for problem_id in problem_ids:
+        prob_evals = evals[problem_id]
+        opt_prob = h5_get_group(opt_grp, '%d' % problem_id)
+        dset = h5_get_dataset(opt_prob, 'results', maxshape=(None,),
+                              dtype=np.float32) 
+        old_size = int(dset.shape[0] / (M+1))
+        raw_results = np.zeros((len(prob_evals)-old_size, len(prob_evals[0].x) + 1))
+        for i, eeval in enumerate(prob_evals[old_size:]):
+            raw_results[i][0] = eeval.y
+            raw_results[i][1:] = list(eeval.x)
+        logger.info(f"Saving {raw_results.shape[0]} trials for problem id %d to {fpath}." % problem_id)
+        h5_concat_dataset(opt_prob['results'], raw_results.ravel())
     
     f.close()
-        
-def eval_obj_fun(obj_fun, pp, space_params, is_int, i, space_vals):
+
+    
+def eval_obj_fun_sp(obj_fun, pp, space_params, is_int, problem_id, i, space_vals):
     """
+    Objective function evaluation (single problem).
     """
+    
+    this_space_vals = space_vals[problem_id]
     for j, key in enumerate(space_params):
-        pp[key] = int(space_vals[j]) if is_int[j] else space_vals[j]
+        pp[key] = int(this_space_vals[j]) if is_int[j] else this_space_vals[j]
 
+    
     result = obj_fun(**pp, pid=i)
-    return result
+    return { problem_id: result }
 
-def gfsinit(gfsopt_params, worker_id=None):
+
+def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_vals):
+    """
+    Objective function evaluation (multiple problems).
+    """
+
+    mpp = {}
+    for problem_id in problem_ids:
+        this_pp = copy.deepcopy(pp)
+        this_space_vals = space_vals[problem_id]
+        for j, key in enumerate(space_params):
+            this_pp[key] = int(this_space_vals[j]) if is_int[j] else this_space_vals[j]
+        mpp[problem_id] = this_pp
+
+    result_dict = obj_fun(mpp, pid=i)
+    return result_dict
+
+
+def gfsinit(gfsopt_params, worker=None):
     objfun = None
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
     if distwq.is_worker:
-        assert (worker_id is not None)
+        assert (worker is not None)
         if objfun_name is not None:
             if objfun_module not in sys.modules:
                 importlib.import_module(objfun_module)
@@ -376,7 +456,7 @@ def gfsinit(gfsopt_params, worker_id=None):
             if objfun_init_module not in sys.modules:
                 importlib.import_module(objfun_init_module)
             objfun_init = eval(objfun_init_name, sys.modules[objfun_init_module].__dict__)
-            objfun = objfun_init(**objfun_init_args, worker_id=worker_id)
+            objfun = objfun_init(**objfun_init_args, worker=worker)
             
     gfsopt_params['obj_fun'] = objfun
     reducefun_module = gfsopt_params.get('reduce_fun_module', '__main__')
@@ -389,13 +469,15 @@ def gfsinit(gfsopt_params, worker_id=None):
     gfsopt = DistGFSOptimizer(**gfsopt_params)
     gfsopt_dict[gfsopt.opt_id] = gfsopt
     return gfsopt
-    
+
+
 def gfsctrl(controller, gfsopt_params):
     """Controller for distributed GFS optimization."""
     gfsopt = gfsinit(gfsopt_params)
     logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
     iter_count = 0
     task_ids = []
+    n_tasks = 0
     while iter_count < gfsopt.n_iter:
         controller.recv()
         
@@ -409,20 +491,30 @@ def gfsctrl(controller, gfsopt_params):
                 rres = res
             else:
                 rres = gfsopt.reduce_fun(res)
-            eval_req = gfsopt.evals[task_id]
-            vals = list(eval_req.x)
-            eval_req.set(rres)
+
+            for problem_id in rres:
+                eval_req = gfsopt.evals[problem_id][task_id]
+                vals = list(eval_req.x)
+                eval_req.set(rres[problem_id])
+                logger.info("problem id %d: optimization iteration %d: parameter coordinates %s: %s" % (problem_id, iter_count, str(vals), str(rres[problem_id])))
+                
             task_ids.remove(task_id)
             iter_count += 1
-            logger.info("optimization iteration %d: parameter coordinates %s: %s" % (iter_count, str(vals), str(rres)))
             
-        while (len(controller.ready_workers) > 0) and (len(gfsopt.evals) < gfsopt.n_iter):
-            eval_req = gfsopt.optimizer.get_next_x()
-            vals = list(eval_req.x)
+        while (len(controller.ready_workers) > 0) and (n_tasks < gfsopt.n_iter):
+            vals_dict = {}
+            eval_req_dict = {}
+            for problem_id in gfsopt.problem_ids:
+                eval_req = gfsopt.optimizer_dict[problem_id].get_next_x()
+                eval_req_dict[problem_id] = eval_req
+                vals = list(eval_req.x)
+                vals_dict[problem_id] = vals
             task_id = controller.submit_call("eval_fun", module_name="distgfs",
-                                             args=(gfsopt.opt_id, iter_count, vals,))
+                                             args=(gfsopt.opt_id, iter_count, vals_dict,))
             task_ids.append(task_id)
-            gfsopt.evals[task_id] = eval_req
+            n_tasks += 1
+            for problem_id in gfsopt.problem_ids:
+                gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
                 
     if gfsopt.save:
         gfsopt.save_evals()
@@ -430,7 +522,7 @@ def gfsctrl(controller, gfsopt_params):
 
 def gfswork(worker, gfsopt_params):
     """Worker for distributed GFS optimization."""
-    gfsinit(gfsopt_params, worker_id=worker.worker_id)
+    gfsinit(gfsopt_params, worker=worker)
 
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)

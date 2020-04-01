@@ -14,13 +14,13 @@ def levi(x, y):
     return a + b + c
 
 
-def obj_fun(x, y, pid):
+def obj_fun(pp, pid):
     """ Objective function to be _maximized_ by GFS. """
-    res = levi(x, y)
-    logger.info(f"Iter: {pid}\t x:{x}, y:{y}, result:{res}")
-    # Since Dlib maximizes, but we want to find the minimum,
-    # we negate the result before passing it to the Dlib optimizer.
-    return -res
+    x_0, y_0 = pp[0]['x'], pp[0]['y']
+    x_1, y_1 = pp[1]['x'], pp[1]['y']
+    res = {0: -levi(0.5*x_0, y_0), 1: -levi(0.4*x_1, y_1)}
+    logger.info(f"Iter: {pid}\t x_0:{x_0}, x_1:{x_1}, y_0:{y_0}, y:{y_1}, result:{res}")
+    return res
 
 if __name__ == '__main__':
 
@@ -30,13 +30,14 @@ if __name__ == '__main__':
     problem_parameters = {'y': 1.}
     
     # Create an optimizer parameter set
-    distgfs_params = {'opt_id': 'distgfs_levi',
+    distgfs_params = {'opt_id': 'distgfs_levi_multi',
+                      'problem_ids': set([0, 1]),
                       'obj_fun_name': 'obj_fun',
-                      'obj_fun_module': 'example_distgfs_levi_file',
+                      'obj_fun_module': 'example_distgfs_levi_multi',
                       'problem_parameters': problem_parameters,
                       'space': space,
                       'n_iter': 10,
-                      'file_path': 'distgfs.levi.h5',
+                      'file_path': 'distgfs.levi.multi.h5',
                       'save': True
                       }
 
