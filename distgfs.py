@@ -451,7 +451,6 @@ def gfsinit(gfsopt_params, worker=None):
             objfun_init_module = gfsopt_params.get('obj_fun_init_module', '__main__')
             objfun_init_name = gfsopt_params.get('obj_fun_init_name', None)
             objfun_init_args = gfsopt_params.get('obj_fun_init_args', None)
-            objfun_init_args['worker'] = gfsopt_params.get('worker', None)
             if objfun_init_name is None:
                 raise RuntimeError("distgfs.gfsinit: objfun is not provided")
             if objfun_init_module not in sys.modules:
