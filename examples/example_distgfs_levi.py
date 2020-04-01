@@ -16,7 +16,7 @@ def levi(x, y):
 
 def obj_fun(x, y, pid):
     """ Objective function to be _maximized_ by GFS. """
-    res = levi(x, y)
+    res = levi(0.4*x, y)
     logger.info(f"Iter: {pid}\t x:{x}, y:{y}, result:{res}")
     # Since Dlib maximizes, but we want to find the minimum,
     # we negate the result before passing it to the Dlib optimizer.
