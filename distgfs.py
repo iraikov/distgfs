@@ -4,7 +4,6 @@ import numpy as np
 import dlib
 import distwq
 
-logger = logging.getLogger(__name__)
 try:
     import h5py
 except ImportError as e:
@@ -18,6 +17,7 @@ class DistGFSOptimizer():
         self,
         opt_id,
         obj_fun,
+        verbose=False,
         reduce_fun=None,
         problem_ids=None,
         problem_parameters=None,
@@ -79,8 +79,12 @@ class DistGFSOptimizer():
         """
 
         self.opt_id = opt_id
-            
-        
+        self.verbose = verbose
+
+        self.logger = logging.getLogger(opt_id)
+        if self.verbose:
+            self.logger.setLevel(logging.INFO)
+
         # Verify inputs
         if file_path is None:
             if problem_parameters is None or space is None:
@@ -111,7 +115,7 @@ class DistGFSOptimizer():
         if file_path is not None:
             if os.path.isfile(file_path):
                 old_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids = \
-                  init_from_h5(file_path, param_names, opt_id)
+                  init_from_h5(file_path, param_names, opt_id, self.logger)
         eps = 0.0005 if eps is None else eps
         noise_mag = 0.001 if noise_mag is None else noise_mag
         spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_int)
@@ -183,10 +187,10 @@ class DistGFSOptimizer():
         if self.has_problem_ids:
             for problem_id in self.problem_ids:
                 res, prms = best_results[problem_id]
-                logger.info(f"Best eval so far for id {problem_id}: {res}@{prms}")
+                self.logger.info(f"Best eval so far for id {problem_id}: {res}@{prms}")
         else:
             res, prms = best_results
-            logger.info(f"Best eval so far for: {res}@{prms}")
+            self.logger.info(f"Best eval so far for: {res}@{prms}")
             
 
 def h5_get_group (h, groupname):
@@ -341,7 +345,7 @@ def h5_load_all(file_path, opt_id):
             evals[problem_id].append(result)
     return raw_spec, spec, evals, info, prev_best_dict
     
-def init_from_h5(file_path, param_names, opt_id):        
+def init_from_h5(file_path, param_names, opt_id, logger):        
     # Load progress and settings from file, then compare each
     # restored setting with settings specified by args (if any)
     old_raw_spec, old_spec, old_evals, info, prev_best = h5_load_all(file_path, opt_id)
@@ -436,7 +440,7 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     return result_dict
 
 
-def gfsinit(gfsopt_params, worker=None):
+def gfsinit(gfsopt_params, worker=None, verbose=False):
     objfun = None
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
@@ -466,13 +470,16 @@ def gfsinit(gfsopt_params, worker=None):
     if reducefun_name is not None:
         reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
         gfsopt_params['reduce_fun'] = reducefun        
-    gfsopt = DistGFSOptimizer(**gfsopt_params)
+    gfsopt = DistGFSOptimizer(**gfsopt_params, verbose=verbose)
     gfsopt_dict[gfsopt.opt_id] = gfsopt
     return gfsopt
 
 
-def gfsctrl(controller, gfsopt_params):
+def gfsctrl(controller, gfsopt_params, verbose=False):
     """Controller for distributed GFS optimization."""
+    logger = logging.getLogger(gfsopt_params['opt_id'])
+    if verbose:
+        logger.setLevel(logging.INFO)
     gfsopt = gfsinit(gfsopt_params)
     logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
     iter_count = 0
@@ -520,22 +527,17 @@ def gfsctrl(controller, gfsopt_params):
         gfsopt.save_evals()
     controller.info()
 
-def gfswork(worker, gfsopt_params):
+def gfswork(worker, gfsopt_params, verbose=False):
     """Worker for distributed GFS optimization."""
-    gfsinit(gfsopt_params, worker=worker)
+    gfsinit(gfsopt_params, worker=worker, verbose=verbose)
 
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
 
 def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
-    if verbose:
-        logging.basicConfig(level=logging.INFO)
-    else:
-        logging.basicConfig(level=logging.WARN)
-    
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
-                   verbose=True, args=(gfsopt_params,),
+                   verbose=True, args=(gfsopt_params, verbose,),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
         opt_id = gfsopt_params['opt_id']
@@ -544,7 +546,7 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
         return gfsopt.get_best()
     else:
         distwq.run(fun_name="gfswork", module_name="distgfs",
-                   verbose=True, args=(gfsopt_params,),
+                   verbose=True, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
         return None, None
