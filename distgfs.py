@@ -354,7 +354,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
     for problem_id in old_evals:
         n_old_evals = len(old_evals[problem_id])
         logger.info(
-            f"Restored {n_old_evals} trials, prev best: "
+            f"Restored {n_old_evals} trials for problem {problem_id}, prev best: "
             f"{prev_best[problem_id][0]}@{list(zip(saved_params, prev_best[problem_id][1:]))}"
         )
     if (param_names is not None) and param_names != saved_params:
