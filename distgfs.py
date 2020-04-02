@@ -168,7 +168,8 @@ class DistGFSOptimizer():
                            for problem_id in self.problem_ids }
         save_to_h5(self.opt_id, self.problem_ids, self.has_problem_ids,
                    self.param_names, self.spec, finished_evals, 
-                   self.eps, self.noise_mag, self.problem_parameters, self.file_path)
+                   self.eps, self.noise_mag, self.problem_parameters, 
+                   self.file_path, self.logger)
 
     def get_best(self):
         best_results = {}
@@ -377,7 +378,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
 
     return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids
 
-def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath):
+def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath, logger):
     """
     Save progress and settings to an HDF5 file 'fpath'.
     """
