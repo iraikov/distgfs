@@ -550,5 +550,5 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
                    verbose=True, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
-        return None, None
+        return None
         
