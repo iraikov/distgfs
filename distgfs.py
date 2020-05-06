@@ -548,6 +548,8 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
     else:
         if 'file_path' in gfsopt_params:
             del(gfsopt_params['file_path'])
+        if 'save' in gfsopt_params:
+            del(gfsopt_params['save'])
         distwq.run(fun_name="gfswork", module_name="distgfs",
                    verbose=True, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
