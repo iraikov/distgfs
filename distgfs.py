@@ -546,6 +546,8 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
         gfsopt.print_best()
         return gfsopt.get_best()
     else:
+        if 'file_path' in gfsopt_params:
+            del(gfsopt_params['file_path'])
         distwq.run(fun_name="gfswork", module_name="distgfs",
                    verbose=True, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
