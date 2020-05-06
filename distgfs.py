@@ -128,8 +128,8 @@ class DistGFSOptimizer():
         for problem_id in problem_ids:
             if problem_id in old_evals:
                 optimizer = dlib.global_function_search(
-                    [spec],
-                    initial_function_evals=[old_evals[problem_id]],
+                    spec,
+                    initial_function_evals=old_evals[problem_id],
                     relative_noise_magnitude=noise_mag
                 )
             else:
