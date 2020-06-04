@@ -446,7 +446,6 @@ def gfsinit(gfsopt_params, worker=None, verbose=False):
     objfun_module = gfsopt_params.get('obj_fun_module', '__main__')
     objfun_name = gfsopt_params.get('obj_fun_name', None)
     if distwq.is_worker:
-        assert (worker is not None)
         if objfun_name is not None:
             if objfun_module not in sys.modules:
                 importlib.import_module(objfun_module)
@@ -494,7 +493,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
 
         if len(task_ids) > 0:
             task_id, res = controller.get_next_result()
-            
+
             if gfsopt.reduce_fun is None:
                 rres = res
             else:
@@ -509,7 +508,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             task_ids.remove(task_id)
             iter_count += 1
             
-        while (len(controller.ready_workers) > 0) and (n_tasks < gfsopt.n_iter):
+        while ((len(controller.ready_workers) > 0) or (not controller.workers_available)) and (n_tasks < gfsopt.n_iter):
             vals_dict = {}
             eval_req_dict = {}
             for problem_id in gfsopt.problem_ids:
