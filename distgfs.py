@@ -550,6 +550,8 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
         if 'save' in gfsopt_params:
             del(gfsopt_params['save'])
         distwq.run(fun_name="gfswork", module_name="distgfs",
+                   broker_fun_name=gfsopt_params.get("broker_fun_name", None),
+                   broker_module_name=gfsopt_params.get("broker_module_name", None),
                    verbose=True, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
