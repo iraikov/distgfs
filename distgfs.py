@@ -420,7 +420,7 @@ def eval_obj_fun_sp(obj_fun, pp, space_params, is_int, problem_id, i, space_vals
         pp[key] = int(this_space_vals[j]) if is_int[j] else this_space_vals[j]
 
     
-    result = obj_fun(**pp, pid=i)
+    result = obj_fun(pp, pid=i)
     return { problem_id: result }
 
 
@@ -537,7 +537,7 @@ def eval_fun(opt_id, *args):
 def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
-                   verbose=True, args=(gfsopt_params, verbose,),
+                   verbose=verbose, args=(gfsopt_params, verbose,),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
         opt_id = gfsopt_params['opt_id']
@@ -552,7 +552,7 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
         distwq.run(fun_name="gfswork", module_name="distgfs",
                    broker_fun_name=gfsopt_params.get("broker_fun_name", None),
                    broker_module_name=gfsopt_params.get("broker_module_name", None),
-                   verbose=True, args=(gfsopt_params, verbose, ),
+                   verbose=verbose, args=(gfsopt_params, verbose, ),
                    spawn_workers=spawn_workers,
                    nprocs_per_worker=nprocs_per_worker)
         return None
