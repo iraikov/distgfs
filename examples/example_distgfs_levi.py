@@ -38,8 +38,7 @@ if __name__ == '__main__':
                       'obj_fun_module': 'example_distgfs_levi',
                       'problem_parameters': problem_parameters,
                       'space': space,
-                      'n_iter': 20,
-                      'n_pareval': 2}
+                      'n_iter': 20}
 
     distgfs.run(distgfs_params, verbose=True)
 

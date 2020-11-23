@@ -38,6 +38,6 @@ if __name__ == '__main__':
                       'space': space,
                       'n_iter': 10}
     
-    distgfs.run(distgfs_params, verbose=True)
+    distgfs.run(distgfs_params, spawn_workers=False, verbose=True)
 
 

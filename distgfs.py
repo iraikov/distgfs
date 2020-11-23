@@ -507,8 +507,13 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
                 
             task_ids.remove(task_id)
             iter_count += 1
-            
-        while ((len(controller.ready_workers) > 0) or (not controller.workers_available)) and (n_tasks < gfsopt.n_iter):
+
+
+        next_eval = False
+        if not controller.workers_available:
+            next_eval = True
+        
+        while ((len(controller.ready_workers) > 0) or next_eval) and (n_tasks < gfsopt.n_iter):
             vals_dict = {}
             eval_req_dict = {}
             for problem_id in gfsopt.problem_ids:
@@ -522,6 +527,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             n_tasks += 1
             for problem_id in gfsopt.problem_ids:
                 gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
+            next_eval = False
                 
     if gfsopt.save:
         gfsopt.save_evals()
