@@ -540,11 +540,13 @@ def gfswork(worker, gfsopt_params, verbose=False):
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
 
-def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
+def run(gfsopt_params, spawn_workers=False, sequential_spawn=False, max_workers=-1, nprocs_per_worker=1, verbose=False):
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
                    verbose=verbose, args=(gfsopt_params, verbose,),
+                   max_workers=max_workers,
                    spawn_workers=spawn_workers,
+                   sequential_spawn=sequential_spawn,
                    nprocs_per_worker=nprocs_per_worker)
         opt_id = gfsopt_params['opt_id']
         gfsopt = gfsopt_dict[opt_id]
@@ -559,7 +561,9 @@ def run(gfsopt_params, spawn_workers=False, nprocs_per_worker=1, verbose=False):
                    broker_fun_name=gfsopt_params.get("broker_fun_name", None),
                    broker_module_name=gfsopt_params.get("broker_module_name", None),
                    verbose=verbose, args=(gfsopt_params, verbose, ),
+                   max_workers=max_workers,
                    spawn_workers=spawn_workers,
+                   sequential_spawn=sequential_spawn,
                    nprocs_per_worker=nprocs_per_worker)
         return None
         
