@@ -277,8 +277,8 @@ def h5_load_raw(input_file, opt_id):
     
     problem_parameters = { parameters_name_dict[idx]: val
                            for idx, val in opt_grp['problem_parameters'] }
-    parameter_spec_dict = { parameters_name_dict[spec[0]]: tuple(spec)[1:] 
-                            for spec in iter(opt_grp['parameter_spec']) }
+    parameter_specs = [ parameters_name_dict[spec[0]]: tuple(spec)[1:] 
+                        for spec in iter(opt_grp['parameter_spec']) ]
 
     problem_ids = None
     if 'problem_ids' in opt_grp:
@@ -297,7 +297,7 @@ def h5_load_raw(input_file, opt_id):
     is_integer = []
     lower = []
     upper = []
-    for parm, spec in parameter_spec_dict.items():
+    for parm, spec in parameter_specs:
         param_names.append(parm)
         is_int, lo, hi = spec
         is_integer.append(is_int)
