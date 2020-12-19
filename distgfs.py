@@ -277,14 +277,14 @@ def h5_load_raw(input_file, opt_id):
     
     problem_parameters = { parameters_name_dict[idx]: val
                            for idx, val in opt_grp['problem_parameters'] }
-    parameter_specs = [ parameters_name_dict[spec[0]]: tuple(spec)[1:] 
+    parameter_specs = [ (parameters_name_dict[spec[0]], tuple(spec)[1:])
                         for spec in iter(opt_grp['parameter_spec']) ]
 
     problem_ids = None
     if 'problem_ids' in opt_grp:
         problem_ids = set(opt_grp['problem_ids'])
     
-    M = len(parameter_spec_dict)
+    M = len(parameter_specs)
     raw_results = {}
     if problem_ids is not None:
         for problem_id in problem_ids:
@@ -492,21 +492,25 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             gfsopt.save_evals()
 
         if len(task_ids) > 0:
-            task_id, res = controller.get_next_result()
+            ret = controller.probe_next_result()
 
-            if gfsopt.reduce_fun is None:
-                rres = res
-            else:
-                rres = gfsopt.reduce_fun(res)
+            if ret is not None:
 
-            for problem_id in rres:
-                eval_req = gfsopt.evals[problem_id][task_id]
-                vals = list(eval_req.x)
-                eval_req.set(rres[problem_id])
-                logger.info("problem id %d: optimization iteration %d: parameter coordinates %s: %s" % (problem_id, iter_count, str(vals), str(rres[problem_id])))
+                task_id, res = ret
                 
-            task_ids.remove(task_id)
-            iter_count += 1
+                if gfsopt.reduce_fun is None:
+                    rres = res
+                else:
+                    rres = gfsopt.reduce_fun(res)
+
+                for problem_id in rres:
+                    eval_req = gfsopt.evals[problem_id][task_id]
+                    vals = list(eval_req.x)
+                    eval_req.set(rres[problem_id])
+                    logger.info("problem id %d: optimization iteration %d: parameter coordinates %s: %s" % (problem_id, iter_count, str(vals), str(rres[problem_id])))
+                
+                task_ids.remove(task_id)
+                iter_count += 1
 
 
         next_eval = False
