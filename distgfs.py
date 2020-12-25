@@ -400,12 +400,13 @@ def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, s
         dset = h5_get_dataset(opt_prob, 'results', maxshape=(None,),
                               dtype=np.float32) 
         old_size = int(dset.shape[0] / (M+1))
-        raw_results = np.zeros((len(prob_evals)-old_size, len(prob_evals[0].x) + 1))
-        for i, eeval in enumerate(prob_evals[old_size:]):
-            raw_results[i][0] = eeval.y
-            raw_results[i][1:] = list(eeval.x)
-        logger.info(f"Saving {raw_results.shape[0]} trials for problem id %d to {fpath}." % problem_id)
-        h5_concat_dataset(opt_prob['results'], raw_results.ravel())
+        if len(prob_evals) > old_size:
+            raw_results = np.zeros((len(prob_evals)-old_size, len(prob_evals[0].x) + 1))
+            for i, eeval in enumerate(prob_evals[old_size:]):
+                raw_results[i][0] = eeval.y
+                raw_results[i][1:] = list(eeval.x)
+            logger.info(f"Saving {raw_results.shape[0]} trials for problem id %d to {fpath}." % problem_id)
+            h5_concat_dataset(opt_prob['results'], raw_results.ravel())
     
     f.close()
 
