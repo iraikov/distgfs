@@ -518,7 +518,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
         if not controller.workers_available:
             next_eval = True
         
-        while ((len(controller.ready_workers) > 0) or next_eval) and (n_tasks < gfsopt.n_iter):
+        if ((len(controller.ready_workers) > 0) or next_eval) and (n_tasks < gfsopt.n_iter):
             vals_dict = {}
             eval_req_dict = {}
             for problem_id in gfsopt.problem_ids:
