@@ -514,11 +514,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
                 iter_count += 1
 
 
-        next_eval = False
-        if not controller.workers_available:
-            next_eval = True
-        
-        if ((len(controller.ready_workers) > 0) or next_eval) and (n_tasks < gfsopt.n_iter):
+        if ((len(controller.ready_workers) > 0) or (not controller.workers_available)) and (n_tasks < gfsopt.n_iter):
             vals_dict = {}
             eval_req_dict = {}
             for problem_id in gfsopt.problem_ids:
@@ -532,7 +528,6 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             n_tasks += 1
             for problem_id in gfsopt.problem_ids:
                 gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
-            next_eval = False
                 
     if gfsopt.save:
         gfsopt.save_evals()
@@ -545,14 +540,15 @@ def gfswork(worker, gfsopt_params, verbose=False):
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
 
-def run(gfsopt_params, spawn_workers=False, sequential_spawn=False, max_workers=-1, nprocs_per_worker=1, verbose=False):
+def run(gfsopt_params, collective_mode="gather", spawn_workers=False, sequential_spawn=False, max_workers=-1, nprocs_per_worker=1, verbose=False):
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
                    verbose=verbose, args=(gfsopt_params, verbose,),
                    max_workers=max_workers,
                    spawn_workers=spawn_workers,
                    sequential_spawn=sequential_spawn,
-                   nprocs_per_worker=nprocs_per_worker)
+                   nprocs_per_worker=nprocs_per_worker,
+                   collective_mode=collective_mode)
         opt_id = gfsopt_params['opt_id']
         gfsopt = gfsopt_dict[opt_id]
         gfsopt.print_best()
@@ -569,6 +565,7 @@ def run(gfsopt_params, spawn_workers=False, sequential_spawn=False, max_workers=
                    max_workers=max_workers,
                    spawn_workers=spawn_workers,
                    sequential_spawn=sequential_spawn,
-                   nprocs_per_worker=nprocs_per_worker)
+                   nprocs_per_worker=nprocs_per_worker,
+                   collective_mode=collective_mode)
         return None
         
