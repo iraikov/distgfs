@@ -24,6 +24,7 @@ class DistGFSOptimizer():
         space=None,
         solver_epsilon=None,
         relative_noise_magnitude=None,
+        seed=None,
         n_iter=100,
         nprocs_per_worker=1,
         save_iter=10,
@@ -31,8 +32,7 @@ class DistGFSOptimizer():
         save=False,
         **kwargs
     ):
-        """
-        `Creates an optimizer based on the Global Function Search
+        """`Creates an optimizer based on the Global Function Search
         <http://dlib.net/optimization.html#global_function_search>`_
         (GFS) optimizer in dlib. Supports distributed optimization
         runs via mpi4py. Based on GFSOPtimizer by https://github.com/tsoernes
@@ -76,6 +76,9 @@ class DistGFSOptimizer():
             <http://dlib.net/dlib/global_optimization/upper_bound_function_abstract.h.html
             #upper_bound_function>`_
             for further documentation. Default: 0.001
+        :param float seed: (optional) Sets the seed used for random
+            sampling by the optimization algorithm. If None, the optimizer will always
+            produce the same deterministic behavior.  Default: None
         """
 
         self.opt_id = opt_id
@@ -138,6 +141,8 @@ class DistGFSOptimizer():
                 )
                 optimizer.set_relative_noise_magnitude(noise_mag)
             optimizer.set_solver_epsilon(eps)
+            if seed is not None:
+                optimizer.set_seed(seed)
             optimizer_dict[problem_id] = optimizer
         
         self.optimizer_dict = optimizer_dict

@@ -36,6 +36,7 @@ if __name__ == '__main__':
                       'obj_fun_module': 'example_distgfs_beale',
                       'problem_parameters': problem_parameters,
                       'space': space,
+                      'seed': 42,
                       'n_iter': 10}
     
     distgfs.run(distgfs_params, spawn_workers=False, verbose=True)
