@@ -1,7 +1,9 @@
 import math, logging, distgfs, pickle
+import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+feature_dtypes = [('pid', np.int32)]
 
 def levi(x, y):
     """
@@ -20,7 +22,8 @@ def obj_fun(pp, pid):
     logger.info(f"Iter: {pid}\t x:{pp['x']}, y:{pp['y']}, result:{res}")
     # Since Dlib maximizes, but we want to find the minimum,
     # we negate the result before passing it to the Dlib optimizer.
-    return -res
+    return -res, np.array(pid, dtype=np.dtype(feature_dtypes))
+
 
 if __name__ == '__main__':
 
@@ -37,7 +40,8 @@ if __name__ == '__main__':
                       'space': space,
                       'n_iter': 10,
                       'file_path': 'distgfs.levi.h5',
-                      'save': True
+                      'save': True,
+                      'feature_dtypes': feature_dtypes,
                       }
 
     distgfs.run(distgfs_params, verbose=True)

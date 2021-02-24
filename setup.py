@@ -5,7 +5,7 @@ import setuptools
 
 setuptools.setup(
     name="distgfs", 
-    version="0.0.4",
+    version="0.0.5",
     author="Ivan Raikov",
     author_email="ivan.g.raikov@gmail.com",
     description="Distributed global function search via dlib.",

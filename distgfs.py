@@ -22,6 +22,7 @@ class DistGFSOptimizer():
         problem_ids=None,
         problem_parameters=None,
         space=None,
+        feature_dtypes=None,
         solver_epsilon=None,
         relative_noise_magnitude=None,
         seed=None,
@@ -103,6 +104,12 @@ class DistGFSOptimizer():
             if not os.path.isfile(file_path):
                 if problem_parameters is None or space is None:
                     raise FileNotFoundError(file_path)
+
+        self.feature_dtypes = feature_dtypes
+        self.feature_names = None
+        if feature_dtypes is not None:
+            self.feature_names = [dtype[0] for dtype in feature_dtypes]
+            
         eps = solver_epsilon
         noise_mag = relative_noise_magnitude
 
@@ -117,7 +124,7 @@ class DistGFSOptimizer():
         old_evals = {}
         if file_path is not None:
             if os.path.isfile(file_path):
-                old_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids = \
+                old_evals, old_feature_evals, param_names, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids = \
                   init_from_h5(file_path, param_names, opt_id, self.logger)
         eps = 0.0005 if eps is None else eps
         noise_mag = 0.001 if noise_mag is None else noise_mag
@@ -126,7 +133,9 @@ class DistGFSOptimizer():
         has_problem_ids = (problem_ids is not None)
         if not has_problem_ids:
             problem_ids = set([0])
-        
+
+        n_saved_evals = 0
+        n_saved_features = 0
         optimizer_dict = {}
         for problem_id in problem_ids:
             if problem_id in old_evals:
@@ -135,6 +144,7 @@ class DistGFSOptimizer():
                     initial_function_evals=[old_evals[problem_id]],
                     relative_noise_magnitude=noise_mag
                 )
+                n_saved_evals = len(old_evals[problem_id])
             else:
                 optimizer = dlib.global_function_search(
                     [spec]
@@ -152,7 +162,8 @@ class DistGFSOptimizer():
         self.file_path, self.save = file_path, save
 
         self.n_iter = n_iter
-            
+        self.n_saved_evals = n_saved_evals
+        self.n_saved_features = n_saved_features
         self.save_iter = save_iter
 
         if has_problem_ids:
@@ -163,18 +174,30 @@ class DistGFSOptimizer():
         self.reduce_fun = reduce_fun
         
         self.evals = { problem_id: {} for problem_id in problem_ids }
+        self.feature_evals = None
+        if self.feature_names is not None:
+            self.feature_evals = { problem_id: [] for problem_id in problem_ids }
 
         self.has_problem_ids = has_problem_ids
         self.problem_ids = problem_ids
 
     def save_evals(self):
         """Store results of finished evals to file; print best eval"""
-        finished_evals = { problem_id: self.optimizer_dict[problem_id].get_function_evaluations()[1][0]
+        finished_feature_evals = None
+        eval_offset = self.n_saved_evals
+        finished_evals = { problem_id: self.optimizer_dict[problem_id].get_function_evaluations()[1][0][eval_offset:]
                            for problem_id in self.problem_ids }
-        save_to_h5(self.opt_id, self.problem_ids, self.has_problem_ids,
-                   self.param_names, self.spec, finished_evals, 
+        if self.feature_dtypes is not None:
+            feature_offset = self.n_saved_features
+            finished_feature_evals = { problem_id : list([x[1] for x in self.feature_evals[problem_id][feature_offset:]])
+                                       for problem_id in self.problem_ids }
+            self.n_saved_features += len(finished_feature_evals[next(iter(self.problem_ids))])
+        save_to_h5(self.opt_id, self.problem_ids, self.has_problem_ids, self.feature_dtypes,
+                   self.param_names, self.spec, finished_evals, finished_feature_evals,
                    self.eps, self.noise_mag, self.problem_parameters, 
                    self.file_path, self.logger)
+        
+        self.n_saved_evals += len(finished_evals[next(iter(self.problem_ids))])
 
     def get_best(self):
         best_results = {}
@@ -220,7 +243,7 @@ def h5_concat_dataset(dset, data):
     dset[dsize:] = data
     return dset
 
-def h5_init_types(f, opt_id, param_names, problem_parameters, spec):
+def h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, spec):
     
     opt_grp = h5_get_group(f, opt_id)
 
@@ -229,7 +252,55 @@ def h5_init_types(f, opt_id, param_names, problem_parameters, spec):
     # create an HDF5 enumerated type for the parameter label
     param_mapping = { name: idx for (idx, name) in
                       enumerate(param_keys) }
+    
+    feature_keys = None
+    if feature_dtypes is not None:
+        feature_keys = [ feature_dtype[0] for feature_dtype in feature_dtypes ]
 
+    # create HDF5 types for features, if any
+    feature_mapping = None
+    if feature_keys is not None:
+        feature_mapping = { name: idx for (idx, name) in
+                            enumerate(feature_keys) }
+
+    objective_names = ['y']
+    objective_mapping = { name: idx for (idx, name) in
+                          enumerate(objective_names) }
+    dt = h5py.enum_dtype(objective_mapping,
+                         basetype=np.uint16)
+    opt_grp['objective_enum'] = dt
+    dt = np.dtype({ 'names': objective_names,
+                    'formats': [np.float32]})
+    opt_grp['objective_type'] = dt
+    dt = np.dtype([("objective", opt_grp['objective_enum'])])
+    opt_grp['objective_spec_type'] = dt
+    dset = h5_get_dataset(opt_grp, 'objective_spec', maxshape=(len(objective_names),),
+                          dtype=opt_grp['objective_spec_type'].dtype)
+    dset.resize((len(objective_names),))
+    a = np.zeros(len(objective_names), dtype=opt_grp['objective_spec_type'].dtype)
+    for idx, parm in enumerate(objective_names):
+        a[idx]["objective"] = objective_mapping[parm]
+    dset[:] = a
+
+    if feature_mapping is not None:
+        dt = h5py.enum_dtype(feature_mapping, basetype=np.uint16)
+        opt_grp['feature_enum'] = dt
+
+        dt = np.dtype([("feature", opt_grp['feature_enum'])])
+        opt_grp['feature_spec_type'] = dt
+
+        dt = np.dtype({ 'names': feature_keys,
+                        'formats': [feature_dtype[1] for feature_dtype in feature_dtypes] })
+        opt_grp['feature_type'] = dt
+
+        dset = h5_get_dataset(opt_grp, 'feature_spec', maxshape=(len(feature_keys),),
+                              dtype=opt_grp['feature_spec_type'].dtype)
+        dset.resize((len(feature_keys),))
+        a = np.zeros(len(feature_keys), dtype=opt_grp['feature_spec_type'].dtype)
+        for idx, parm in enumerate(feature_keys):
+            a[idx]["feature"] = feature_mapping[parm]
+        dset[:] = a
+    
     dt = h5py.enum_dtype(param_mapping, basetype=np.uint16)
     opt_grp['parameter_enum'] = dt
 
@@ -267,6 +338,10 @@ def h5_init_types(f, opt_id, param_names, problem_parameters, spec):
         a[idx]["lower"] = lo
         a[idx]["upper"] = hi
     dset[:] = a
+
+    dt = np.dtype({ 'names': param_names, 'formats': [np.float32]*len(param_names) })
+    opt_grp['parameter_space_type'] = dt
+    
     
 def h5_load_raw(input_file, opt_id):
     ## N is number of trials
@@ -276,6 +351,16 @@ def h5_load_raw(input_file, opt_id):
     solver_epsilon = opt_grp['solver_epsilon'][()]
     relative_noise_magnitude = opt_grp['relative_noise_magnitude'][()]
 
+    n_features = 0
+    feature_names = None
+    if 'feature_enum' in opt_grp:
+        feature_enum_dict = h5py.check_enum_dtype(opt_grp['feature_enum'].dtype)
+        feature_idx_dict = { parm: idx for parm, idx in feature_enum_dict.items() }
+        feature_name_dict = { idx: parm for parm, idx in feature_idx_dict.items() }
+        n_features = len(feature_enum_dict)
+        feature_names = [ feature_name_dict[spec[0]]
+                          for spec in iter(opt_grp['feature_spec']) ]
+    
     parameter_enum_dict = h5py.check_enum_dtype(opt_grp['parameter_enum'].dtype)
     parameters_idx_dict = { parm: idx for parm, idx in parameter_enum_dict.items() }
     parameters_name_dict = { idx: parm for parm, idx in parameters_idx_dict.items() }
@@ -289,13 +374,14 @@ def h5_load_raw(input_file, opt_id):
     if 'problem_ids' in opt_grp:
         problem_ids = set(opt_grp['problem_ids'])
     
-    M = len(parameter_specs)
     raw_results = {}
-    if problem_ids is not None:
-        for problem_id in problem_ids:
-            raw_results[problem_id] = opt_grp['%d' % problem_id]['results'][:].reshape((-1,M+1)) # np.array of shape [N, M+1]
-    else:
-        raw_results[0] = opt_grp['%d' % 0]['results'][:].reshape((-1,M+1)) # np.array of shape [N, M+1]
+    for problem_id in problem_ids if problem_ids is not None else [0]:
+        if str(problem_id) in opt_grp:
+            raw_results[problem_id] = { 'objectives': opt_grp[str(problem_id)]['objectives'][:],
+                                        'parameters': opt_grp[str(problem_id)]['parameters'][:] }
+            if 'features' in opt_grp[str(problem_id)]:
+                raw_results[problem_id]['features'] = opt_grp[str(problem_id)]['features'][:]
+
     f.close()
     
     param_names = []
@@ -311,7 +397,8 @@ def h5_load_raw(input_file, opt_id):
         
 
     raw_spec = (is_integer, lower, upper)
-    info = { 'params': param_names,
+    info = { 'features': feature_names,
+             'params': param_names,
              'solver_epsilon': solver_epsilon,
              'relative_noise_magnitude': relative_noise_magnitude,
              'problem_parameters': problem_parameters,
@@ -339,28 +426,43 @@ def h5_load_all(file_path, opt_id):
     """
     raw_spec, raw_problem_results, info = h5_load_raw(file_path, opt_id)
     is_integer, lo_bounds, hi_bounds = raw_spec
+    feature_names = info['features']
     spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_integer)
     evals = { problem_id: [] for problem_id in raw_problem_results }
+    n_features = 0
+    feature_evals = None
+    if feature_names is not None:
+        n_features = len(feature_names)
+        feature_evals = { problem_id: [] for problem_id in raw_problem_results }
     prev_best_dict = {}
     for problem_id in raw_problem_results:
         raw_results = raw_problem_results[problem_id]
-        prev_best_dict[problem_id] = raw_results[np.argmax(raw_results, axis=0)[0]]
-        for raw_result in raw_results:
-            x = list(raw_result[1:])
-            result = dlib.function_evaluation(x=x, y=raw_result[0])
+        ys = raw_results['objectives']['y']
+        xs = raw_results['parameters']
+        fs = None
+        if n_features > 0:
+            fs = raw_results['features']
+        prev_best_index = np.argmax(ys, axis=0)
+        prev_best_dict[problem_id] = (ys[prev_best_index], xs[prev_best_index])
+        for i in range(ys.shape[0]):
+            x = list(xs[i])
+            result = dlib.function_evaluation(x=x, y=ys[i])
             evals[problem_id].append(result)
-    return raw_spec, spec, evals, info, prev_best_dict
+            if fs is not None:
+                feature_evals[problem_id].append(fs[i])
+                
+    return raw_spec, spec, evals, feature_evals, info, prev_best_dict
     
 def init_from_h5(file_path, param_names, opt_id, logger):        
     # Load progress and settings from file, then compare each
     # restored setting with settings specified by args (if any)
-    old_raw_spec, old_spec, old_evals, info, prev_best = h5_load_all(file_path, opt_id)
+    old_raw_spec, old_spec, old_evals, old_feature_evals, info, prev_best = h5_load_all(file_path, opt_id)
     saved_params = info['params']
     for problem_id in old_evals:
         n_old_evals = len(old_evals[problem_id])
         logger.info(
             f"Restored {n_old_evals} trials for problem {problem_id}, prev best: "
-            f"{prev_best[problem_id][0]}@{list(zip(saved_params, prev_best[problem_id][1:]))}"
+            f"{prev_best[problem_id][0]}@{list(zip(saved_params, prev_best[problem_id][1]))}"
         )
     if (param_names is not None) and param_names != saved_params:
         # Switching params being optimized over would throw off Dlib.
@@ -381,16 +483,16 @@ def init_from_h5(file_path, param_names, opt_id, logger):
     problem_parameters = info['problem_parameters']
     problem_ids = info['problem_ids'] if 'problem_ids' in info else None
 
-    return old_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids
+    return old_evals, old_feature_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids
 
-def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath, logger):
+def save_to_h5(opt_id, problem_ids, has_problem_ids, feature_dtypes, param_names, spec, evals, feature_evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath, logger):
     """
     Save progress and settings to an HDF5 file 'fpath'.
     """
 
     f = h5py.File(fpath, "a")
     if opt_id not in f.keys():
-        h5_init_types(f, opt_id, param_names, problem_parameters, spec)
+        h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, spec)
         opt_grp = h5_get_group(f, opt_id)
         opt_grp['solver_epsilon'] = solver_epsilon
         opt_grp['relative_noise_magnitude'] = relative_noise_magnitude
@@ -398,21 +500,31 @@ def save_to_h5(opt_id, problem_ids, has_problem_ids, param_names, spec, evals, s
             opt_grp['problem_ids'] = np.asarray(list(problem_ids), dtype=np.int32)
 
     opt_grp = h5_get_group(f, opt_id)
-    M = len(param_names)
     for problem_id in problem_ids:
         prob_evals = evals[problem_id]
+        prob_features = None
+        if feature_evals is not None:
+            prob_features = feature_evals[problem_id]
         opt_prob = h5_get_group(opt_grp, '%d' % problem_id)
-        dset = h5_get_dataset(opt_prob, 'results', maxshape=(None,),
-                              dtype=np.float32) 
-        old_size = int(dset.shape[0] / (M+1))
-        if len(prob_evals) > old_size:
-            raw_results = np.zeros((len(prob_evals)-old_size, len(prob_evals[0].x) + 1))
-            for i, eeval in enumerate(prob_evals[old_size:]):
-                raw_results[i][0] = eeval.y
-                raw_results[i][1:] = list(eeval.x)
-            logger.info(f"Saving {raw_results.shape[0]} trials for problem id %d to {fpath}." % problem_id)
-            h5_concat_dataset(opt_prob['results'], raw_results.ravel())
-    
+
+        logger.info(f"Saving {len(prob_evals)} trials for problem id %d to {fpath}." % problem_id)
+
+        dset = h5_get_dataset(opt_prob, 'objectives', maxshape=(None,),
+                              dtype=opt_grp['objective_type'])
+        data = np.array([tuple([eeval.y]) for eeval in prob_evals], dtype=opt_grp['objective_type'])
+        h5_concat_dataset(dset, data)
+
+        dset = h5_get_dataset(opt_prob, 'parameters', maxshape=(None,),
+                              dtype=opt_grp['parameter_space_type'])
+        data = np.array([tuple(eeval.x) for eeval in prob_evals], dtype=opt_grp['parameter_space_type'])
+        h5_concat_dataset(dset, data)
+
+        if prob_features is not None:
+            dset = h5_get_dataset(opt_prob, 'features', maxshape=(None,),
+                                  dtype=opt_grp['feature_type'])
+            data = np.concatenate(prob_features, axis=None)
+            h5_concat_dataset(dset, data)
+            
     f.close()
 
     
@@ -512,7 +624,11 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
                 for problem_id in rres:
                     eval_req = gfsopt.evals[problem_id][task_id]
                     vals = list(eval_req.x)
-                    eval_req.set(rres[problem_id])
+                    if gfsopt.feature_names is None:
+                        eval_req.set(rres[problem_id])
+                    else:
+                        eval_req.set(rres[problem_id][0])
+                        gfsopt.feature_evals[problem_id].append((task_id, rres[problem_id][1]))
                     logger.info("problem id %d: optimization iteration %d: parameter coordinates %s: %s" % (problem_id, iter_count, str(vals), str(rres[problem_id])))
                 
                 task_ids.remove(task_id)
