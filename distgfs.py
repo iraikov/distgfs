@@ -502,6 +502,9 @@ def save_to_h5(opt_id, problem_ids, has_problem_ids, feature_dtypes, param_names
     opt_grp = h5_get_group(f, opt_id)
     for problem_id in problem_ids:
         prob_evals = evals[problem_id]
+        if not (len(prob_evals) > 0):
+            continue
+
         prob_features = None
         if feature_evals is not None:
             prob_features = feature_evals[problem_id]
