@@ -3,7 +3,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-feature_dtypes = [('pid', np.int32)]
+feature_dtypes = [('pid1', (np.int32, 2)), ('pid2', (np.float32, 4)) ]
 
 def levi(x, y):
     """
@@ -22,7 +22,7 @@ def obj_fun(pp, pid):
     logger.info(f"Iter: {pid}\t x:{pp['x']}, y:{pp['y']}, result:{res}")
     # Since Dlib maximizes, but we want to find the minimum,
     # we negate the result before passing it to the Dlib optimizer.
-    return -res, np.array(pid, dtype=np.dtype(feature_dtypes))
+    return -res, np.array([[pid, pid], [float(pid), float(pid)]], dtype=np.dtype(feature_dtypes))
 
 
 if __name__ == '__main__':

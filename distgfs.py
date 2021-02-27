@@ -17,7 +17,6 @@ class DistGFSOptimizer():
         self,
         opt_id,
         obj_fun,
-        verbose=False,
         reduce_fun=None,
         problem_ids=None,
         problem_parameters=None,
@@ -31,6 +30,8 @@ class DistGFSOptimizer():
         save_iter=10,
         file_path=None,
         save=False,
+        metadata=None,
+        verbose=False,
         **kwargs
     ):
         """`Creates an optimizer based on the Global Function Search
@@ -38,6 +39,15 @@ class DistGFSOptimizer():
         (GFS) optimizer in dlib. Supports distributed optimization
         runs via mpi4py. Based on GFSOPtimizer by https://github.com/tsoernes
 
+        :param string opt_id: optimization group id
+            An identifier to associate with this class of optimization runs.
+        :param func obj_fun: function to maximize.
+            Must take as argument every parameter specified in
+            both 'problem_parameters' and 'space', in addition to 'pid',
+            and return the result as float.
+            'pid' specifies simulation run number.
+            If you want to minimize instead,
+            simply negate the result in the objective function before returning it.
         :param set problem_ids (optional): Set of problem ids.
             For solving sets of related problems with the same set of parameters.
             If this parameter is not None, it is expected that the objective function 
@@ -55,13 +65,8 @@ class DistGFSOptimizer():
             ``{'alpha': (0.65, 0.85), 'gamma': (1, 8)}``. If both bounds for a
             parameter are Ints, then only integers within the (inclusive) range
             will be sampled and tested.
-        :param func obj_fun: function to maximize.
-            Must take as argument every parameter specified in
-            both 'problem_parameters' and 'space', in addition to 'pid',
-            and return the result as float.
-            'pid' specifies simulation run number.
-            If you want to minimize instead,
-            simply negate the result in the objective function before returning it.
+        :param func reduce_fun: function to reduce multiple results per evaluation obtained from each distributed worker.
+            Must take as argument a list of objective evaluations.
         :param int n_iter: (optional) Number of times to sample and test params.
         :param int save_iter: (optional) How often to save progress.
         :param str file_path: (optional) File name for restoring and/or saving results and settings.
@@ -156,7 +161,7 @@ class DistGFSOptimizer():
             optimizer_dict[problem_id] = optimizer
         
         self.optimizer_dict = optimizer_dict
-        
+        self.metadata = metadata
         self.problem_parameters, self.param_names, self.spec = problem_parameters, param_names, spec
         self.eps, self.noise_mag, self.is_int = eps, noise_mag, is_int
         self.file_path, self.save = file_path, save
@@ -195,7 +200,7 @@ class DistGFSOptimizer():
         save_to_h5(self.opt_id, self.problem_ids, self.has_problem_ids, self.feature_dtypes,
                    self.param_names, self.spec, finished_evals, finished_feature_evals,
                    self.eps, self.noise_mag, self.problem_parameters, 
-                   self.file_path, self.logger)
+                   self.metadata, self.file_path, self.logger)
         
         self.n_saved_evals += len(finished_evals[next(iter(self.problem_ids))])
 
@@ -243,7 +248,7 @@ def h5_concat_dataset(dset, data):
     dset[dsize:] = data
     return dset
 
-def h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, spec):
+def h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, spec, metadata=None):
     
     opt_grp = h5_get_group(f, opt_id)
 
@@ -485,7 +490,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
 
     return old_evals, old_feature_evals, params, is_int, lo_bounds, hi_bounds, eps, noise_mag, problem_parameters, problem_ids
 
-def save_to_h5(opt_id, problem_ids, has_problem_ids, feature_dtypes, param_names, spec, evals, feature_evals, solver_epsilon, relative_noise_magnitude, problem_parameters, fpath, logger):
+def save_to_h5(opt_id, problem_ids, has_problem_ids, feature_dtypes, param_names, spec, evals, feature_evals, solver_epsilon, relative_noise_magnitude, problem_parameters, metadata, fpath, logger):
     """
     Save progress and settings to an HDF5 file 'fpath'.
     """
@@ -494,6 +499,8 @@ def save_to_h5(opt_id, problem_ids, has_problem_ids, feature_dtypes, param_names
     if opt_id not in f.keys():
         h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, spec)
         opt_grp = h5_get_group(f, opt_id)
+        if metadata is not None:
+            opt_grp['metadata'] = metadata
         opt_grp['solver_epsilon'] = solver_epsilon
         opt_grp['relative_noise_magnitude'] = relative_noise_magnitude
         if has_problem_ids:
