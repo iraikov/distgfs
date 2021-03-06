@@ -26,7 +26,7 @@ class DistGFSOptimizer():
         relative_noise_magnitude=None,
         seed=None,
         n_iter=100,
-        nprocs_per_worker=1,
+        n_max_tasks=-1,
         save_iter=10,
         file_path=None,
         save=False,
@@ -167,6 +167,7 @@ class DistGFSOptimizer():
         self.file_path, self.save = file_path, save
 
         self.n_iter = n_iter
+        self.n_max_tasks = n_max_tasks
         self.n_saved_evals = n_saved_evals
         self.n_saved_features = n_saved_features
         self.save_iter = save_iter
@@ -608,6 +609,11 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
     logger = logging.getLogger(gfsopt_params['opt_id'])
     if verbose:
         logger.setLevel(logging.INFO)
+    
+    if gfsopt_params.get('n_max_tasks', None) is None:
+        gfsopt_params['n_max_tasks'] = distwq.n_workers
+    if gfsopt_params['n_max_tasks'] < 1:
+        gfsopt_params['n_max_tasks'] = distwq.n_workers
     gfsopt = gfsinit(gfsopt_params)
     logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
     iter_count = 0
@@ -645,20 +651,21 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
                 iter_count += 1
 
 
-        if ((len(controller.ready_workers) > 0) or (not controller.workers_available)) and (n_tasks < gfsopt.n_iter):
-            vals_dict = {}
-            eval_req_dict = {}
-            for problem_id in gfsopt.problem_ids:
-                eval_req = gfsopt.optimizer_dict[problem_id].get_next_x()
-                eval_req_dict[problem_id] = eval_req
-                vals = list(eval_req.x)
-                vals_dict[problem_id] = vals
-            task_id = controller.submit_call("eval_fun", module_name="distgfs",
-                                             args=(gfsopt.opt_id, iter_count, vals_dict,))
-            task_ids.append(task_id)
-            n_tasks += 1
-            for problem_id in gfsopt.problem_ids:
-                gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
+        if (n_tasks < gfsopt.n_iter) and (len(task_ids) == 0):
+            while len(task_ids) < gfsopt.n_max_tasks:
+                vals_dict = {}
+                eval_req_dict = {}
+                for problem_id in gfsopt.problem_ids:
+                    eval_req = gfsopt.optimizer_dict[problem_id].get_next_x()
+                    eval_req_dict[problem_id] = eval_req
+                    vals = list(eval_req.x)
+                    vals_dict[problem_id] = vals
+                task_id = controller.submit_call("eval_fun", module_name="distgfs",
+                                                 args=(gfsopt.opt_id, iter_count, vals_dict,))
+                task_ids.append(task_id)
+                n_tasks += 1
+                for problem_id in gfsopt.problem_ids:
+                    gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
                 
     if gfsopt.save:
         gfsopt.save_evals()
@@ -671,7 +678,8 @@ def gfswork(worker, gfsopt_params, verbose=False):
 def eval_fun(opt_id, *args):
     return gfsopt_dict[opt_id].eval_fun(*args)
 
-def run(gfsopt_params, collective_mode="gather", spawn_workers=False, sequential_spawn=False, max_workers=-1, nprocs_per_worker=1, verbose=False):
+def run(gfsopt_params, collective_mode="gather", spawn_workers=False, sequential_spawn=False, max_workers=-1, nprocs_per_worker=1, 
+        verbose=False):
     if distwq.is_controller:
         distwq.run(fun_name="gfsctrl", module_name="distgfs",
                    verbose=verbose, args=(gfsopt_params, verbose,),
