@@ -295,8 +295,7 @@ def h5_init_types(f, opt_id, feature_dtypes, param_names, problem_parameters, sp
         dt = np.dtype([("feature", opt_grp['feature_enum'])])
         opt_grp['feature_spec_type'] = dt
 
-        dt = np.dtype({ 'names': feature_keys,
-                        'formats': [feature_dtype[1] for feature_dtype in feature_dtypes] })
+        dt = np.dtype(feature_dtypes)
         opt_grp['feature_type'] = dt
 
         dset = h5_get_dataset(opt_grp, 'feature_spec', maxshape=(len(feature_keys),),
