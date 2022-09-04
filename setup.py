@@ -5,7 +5,7 @@ import setuptools
 
 setuptools.setup(
     name="distgfs", 
-    version="0.0.6",
+    version="0.0.7",
     author="Ivan Raikov",
     author_email="ivan.g.raikov@gmail.com",
     description="Distributed global function search via dlib.",
@@ -20,7 +20,7 @@ setuptools.setup(
     ],
     python_requires='>=3.0',
     install_requires=[
-        'mpi4py', 'numpy', 'h5py', 'distwq>=0.0.8'
+        'mpi4py', 'numpy', 'h5py', 'dlib', 'distwq>=1.0.0'
     ],
 
 )

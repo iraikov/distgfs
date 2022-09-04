@@ -701,7 +701,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
     task_ids = []
     n_tasks = 0
     while iter_count < gfsopt.n_iter:
-        controller.recv()
+        controller.process()
         
         if (iter_count > 0) and gfsopt.save and (iter_count % gfsopt.save_iter == 0):
             gfsopt.save_evals()
