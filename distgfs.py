@@ -740,11 +740,10 @@ def save_to_h5(
         prob_constraints = None
         if constraint_evals is not None:
             prob_constraints = constraint_evals[problem_id]
-        opt_prob = h5_get_group(opt_grp, "%d" % problem_id)
+        opt_prob = h5_get_group(opt_grp, f"{problem_id}")
 
         logger.info(
-            f"Saving {len(prob_evals)} trials for problem id %d to {fpath}."
-            % problem_id
+            f"Saving {len(prob_evals)} trials for problem id {problem_id} to {fpath}."
         )
 
         dset = h5_get_dataset(
@@ -863,7 +862,7 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
     if gfsopt_params["n_max_tasks"] < 1:
         gfsopt_params["n_max_tasks"] = distwq.n_workers
     gfsopt = gfsinit(gfsopt_params)
-    logger.info("Optimizing for %d iterations..." % gfsopt.n_iter)
+    logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
     iter_count = 0
     task_ids = []
     n_tasks = 0
