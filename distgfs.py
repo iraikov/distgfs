@@ -498,9 +498,8 @@ def h5_load_raw(input_file, opt_id):
         feature_names = [
             feature_name_dict[spec[0]] for spec in iter(opt_grp["feature_spec"])
         ]
-        feature_dtype = opt_grp["feature_type"]
-        feature_types = [feature_dtype.fields[x] for x in feature_dtype]
-
+        feature_dtype = opt_grp['feature_type'].dtype
+        feature_types = [feature_dtype.fields[x] for x in feature_dtype.fields]
     n_constraints = 0
     constraint_names = None
     if "constraint_enum" in opt_grp:
