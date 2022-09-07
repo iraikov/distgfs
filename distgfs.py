@@ -963,6 +963,8 @@ def run(
     spawn_startup_wait=None,
     max_workers=-1,
     nprocs_per_worker=1,
+    spawn_executable=None,
+    spawn_args=[], 
     verbose=False,
 ):
     if distwq.is_controller:
@@ -978,6 +980,8 @@ def run(
             spawn_workers=spawn_workers,
             sequential_spawn=sequential_spawn,
             spawn_startup_wait=spawn_startup_wait,
+            spawn_executable=spawn_executable,
+            spawn_args=spawn_args,
             nprocs_per_worker=nprocs_per_worker,
             collective_mode=collective_mode,
         )
@@ -1004,6 +1008,8 @@ def run(
             spawn_workers=spawn_workers,
             sequential_spawn=sequential_spawn,
             spawn_startup_wait=spawn_startup_wait,
+            spawn_executable=spawn_executable,
+            spawn_args=spawn_args,
             nprocs_per_worker=nprocs_per_worker,
             collective_mode=collective_mode,
         )
