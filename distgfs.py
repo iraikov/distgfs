@@ -592,7 +592,7 @@ def h5_load_all(file_path, opt_id):
     raw_spec, raw_problem_results, info = h5_load_raw(file_path, opt_id)
     is_integer, lo_bounds, hi_bounds = raw_spec
     feature_names = info["features"]
-    constraint_names = info["features"]
+    constraint_names = info.get("constraints", None)
     spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_integer)
     evals = {problem_id: [] for problem_id in raw_problem_results}
     n_features = 0
@@ -663,7 +663,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
         raise ValueError(f"Params {params} and spec {raw_spec} are of different length")
 
     feature_types = info["feature_types"]
-    constraint_names = info["constraints"]
+    constraint_names = info.get("constraints", None)
     eps = info["solver_epsilon"]
     noise_mag = info["relative_noise_magnitude"]
     problem_parameters = info["problem_parameters"]
