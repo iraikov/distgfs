@@ -1,4 +1,5 @@
 import math
+
 import distgfs
 
 
@@ -29,7 +30,7 @@ def test_basic():
     # while optimizing 'x' in the range -4.5 to 4.5
     space = {"x": [-4.5, 4.5]}
     problem_parameters = {"y": 1.0}
-    
+
     # Create an optimizer parameter set
     distgfs_params = {
         "opt_id": "distgfs_levi",
@@ -43,5 +44,5 @@ def test_basic():
 
     params, val = distgfs.run(distgfs_params, verbose=True)
     params_dict = dict(params)
-    assert(math.isclose(params_dict["x"], 1.0/0.4, rel_tol=1e-3))
-    assert(math.isclose(val, 0., abs_tol=1e-5))
+    assert math.isclose(params_dict["x"], 1.0 / 0.4, rel_tol=1e-3)
+    assert math.isclose(val, 0.0, abs_tol=1e-5)
