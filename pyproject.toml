@@ -5,6 +5,7 @@ description = "Distributed global function search via dlib"
 authors = ["Ivan Raikov <ivan.g.raikov@gmail.com>"]
 license = "GPL-3.0-or-later"
 readme = "README.md"
+keywords = ["optimization", "distributed optimization", "GFS", "MPI", "mpi4py", "distributed computing"]
 
 [tool.poetry.dependencies]
 python = "^3.8"
