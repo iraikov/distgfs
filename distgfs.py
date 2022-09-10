@@ -5,11 +5,16 @@ import os
 import sys
 import warnings
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 import distwq
 import dlib
 import numpy as np
+from dlib import function_evaluation, function_spec
+from h5py._hl.dataset import Dataset
+from h5py._hl.files import File
+from h5py._hl.group import Group
+from numpy import ndarray
 
 try:
     import h5py
@@ -21,7 +26,12 @@ except ImportError as e:
 gfsopt_dict = {}
 
 
-def validate_inputs(problem_parameters, space, save, file_path):
+def validate_inputs(
+    problem_parameters: Dict[str, float],
+    space: Dict[str, List[float]],
+    save: bool,
+    file_path: Optional[str],
+) -> None:
 
     # Verify inputs
     if file_path is None:
@@ -241,7 +251,7 @@ class DistGFSOptimizer:
         self.has_problem_ids = has_problem_ids
         self.problem_ids = problem_ids
 
-    def save_evals(self):
+    def save_evals(self) -> None:
         """Store results of finished evals to file; print best eval"""
         finished_feature_evals = None
         finished_constraint_evals = None
@@ -320,7 +330,9 @@ class DistGFSOptimizer:
             res, prms = best_results
             self.logger.info(f"Best eval so far for: {res}@{prms}")
 
-    def update_result_value(self, task_id, res):
+    def update_result_value(
+        self, task_id: int, res: Dict[int, Tuple[float, ndarray]]
+    ) -> None:
 
         rres = res
         if self.reduce_fun is not None:
@@ -361,7 +373,7 @@ class DistGFSOptimizer:
             eval_req.set(resval)
 
 
-def h5_get_group(h, groupname):
+def h5_get_group(h: Union[File, Group], groupname: str) -> Group:
     if groupname in h.keys():
         g = h[groupname]
     else:
@@ -369,7 +381,7 @@ def h5_get_group(h, groupname):
     return g
 
 
-def h5_get_dataset(g, dsetname, **kwargs):
+def h5_get_dataset(g: Group, dsetname: str, **kwargs) -> Dataset:
     if dsetname in g.keys():
         dset = g[dsetname]
     else:
@@ -377,7 +389,7 @@ def h5_get_dataset(g, dsetname, **kwargs):
     return dset
 
 
-def h5_concat_dataset(dset, data):
+def h5_concat_dataset(dset: Dataset, data: ndarray) -> Dataset:
     dsize = dset.shape[0]
     newshape = (dsize + len(data),)
     dset.resize(newshape)
@@ -386,15 +398,17 @@ def h5_concat_dataset(dset, data):
 
 
 def h5_init_types(
-    f,
-    opt_id,
-    feature_dtypes,
-    constraint_names,
-    param_names,
-    problem_parameters,
-    spec,
-    metadata=None,
-):
+    f: File,
+    opt_id: str,
+    feature_dtypes: List[
+        Union[Tuple[str, Tuple[Type[int], int]], Tuple[str, Tuple[Type[float], int]]]
+    ],
+    constraint_names: Optional[List[str]],
+    param_names: List[str],
+    problem_parameters: Dict[str, float],
+    spec: function_spec,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
 
     opt_grp = h5_get_group(f, opt_id)
 
@@ -420,7 +434,7 @@ def h5_init_types(
     objective_mapping = {name: idx for (idx, name) in enumerate(objective_names)}
     dt = h5py.enum_dtype(objective_mapping, basetype=np.uint16)
     opt_grp["objective_enum"] = dt
-    dt = np.dtype({"names": objective_names, "formats": [np.float32]})
+    dt = np.dtype({"names": objective_names, "formats": [np.float]})
     opt_grp["objective_type"] = dt
     dt = np.dtype([("objective", opt_grp["objective_enum"])])
     opt_grp["objective_spec_type"] = dt
@@ -483,7 +497,7 @@ def h5_init_types(
     dt = h5py.enum_dtype(param_mapping, basetype=np.uint16)
     opt_grp["parameter_enum"] = dt
 
-    dt = np.dtype([("parameter", opt_grp["parameter_enum"]), ("value", np.float32)])
+    dt = np.dtype([("parameter", opt_grp["parameter_enum"]), ("value", np.float)])
     opt_grp["problem_parameters_type"] = dt
 
     dset = h5_get_dataset(
@@ -504,15 +518,15 @@ def h5_init_types(
         [
             ("parameter", opt_grp["parameter_enum"]),
             ("is_integer", np.bool),
-            ("lower", np.float32),
-            ("upper", np.float32),
+            ("lower", np.float),
+            ("upper", np.float),
         ]
     )
     opt_grp["parameter_spec_type"] = dt
 
     is_integer = np.asarray(spec.is_integer_variable, dtype=np.bool)
-    upper = np.asarray(spec.upper, dtype=np.float32)
-    lower = np.asarray(spec.lower, dtype=np.float32)
+    upper = np.asarray(spec.upper, dtype=np.float)
+    lower = np.asarray(spec.lower, dtype=np.float)
 
     dset = h5_get_dataset(
         opt_grp,
@@ -531,7 +545,7 @@ def h5_init_types(
         a[idx]["upper"] = hi
     dset[:] = a
 
-    dt = np.dtype({"names": param_names, "formats": [np.float32] * len(param_names)})
+    dt = np.dtype({"names": param_names, "formats": [np.float] * len(param_names)})
     opt_grp["parameter_space_type"] = dt
 
 
@@ -741,23 +755,25 @@ def init_from_h5(file_path, param_names, opt_id, logger):
 
 
 def save_to_h5(
-    opt_id,
-    problem_ids,
-    has_problem_ids,
-    feature_dtypes,
-    constraint_names,
-    param_names,
-    spec,
-    evals,
-    feature_evals,
-    constraint_evals,
-    solver_epsilon,
-    relative_noise_magnitude,
-    problem_parameters,
-    metadata,
-    fpath,
-    logger,
-):
+    opt_id: str,
+    problem_ids: Set[int],
+    has_problem_ids: bool,
+    feature_dtypes: List[
+        Union[Tuple[str, Tuple[Type[int], int]], Tuple[str, Tuple[Type[float], int]]]
+    ],
+    constraint_names: Optional[List[str]],
+    param_names: List[str],
+    spec: function_spec,
+    evals: Dict[int, List[function_evaluation]],
+    feature_evals: Dict[int, List[ndarray]],
+    constraint_evals: Optional[Dict[int, List[ndarray]]],
+    solver_epsilon: float,
+    relative_noise_magnitude: float,
+    problem_parameters: Dict[str, float],
+    metadata: Optional[Dict[str, Any]],
+    fpath: str,
+    logger: logging.Logger,
+) -> None:
     """
     Save progress and settings to an HDF5 file 'fpath'.
     """
@@ -779,7 +795,7 @@ def save_to_h5(
         opt_grp["solver_epsilon"] = solver_epsilon
         opt_grp["relative_noise_magnitude"] = relative_noise_magnitude
         if has_problem_ids:
-            opt_grp["problem_ids"] = np.asarray(list(problem_ids), dtype=np.int32)
+            opt_grp["problem_ids"] = np.asarray(list(problem_ids), dtype=np.int)
 
     opt_grp = h5_get_group(f, opt_id)
     for problem_id in problem_ids:
@@ -977,7 +993,25 @@ def gfsctrl(
     controller.info()
 
 
-def gfswork(worker, gfsopt_params, verbose=False):
+def gfswork(
+    worker: distwq.MPIWorker,
+    gfsopt_params: Dict[
+        str,
+        Union[
+            str,
+            Dict[str, float],
+            Dict[str, List[float]],
+            int,
+            List[
+                Union[
+                    Tuple[str, Tuple[Type[int], int]],
+                    Tuple[str, Tuple[Type[float], int]],
+                ]
+            ],
+        ],
+    ],
+    verbose: bool = False,
+) -> None:
     """Worker for distributed GFS optimization."""
     gfsinit(gfsopt_params, worker=worker, verbose=verbose)
 
@@ -991,10 +1025,10 @@ def run(
     collective_mode: str = "gather",
     spawn_workers: bool = False,
     sequential_spawn: bool = False,
-    spawn_startup_wait: None = None,
+    spawn_startup_wait: Optional[int] = None,
     max_workers: int = -1,
     nprocs_per_worker: int = 1,
-    spawn_executable: None = None,
+    spawn_executable: Optional[str] = None,
     spawn_args: List[Any] = [],
     verbose: bool = False,
 ) -> Tuple[List[Tuple[str, float]], float]:
