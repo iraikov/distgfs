@@ -24,13 +24,12 @@ def obj_fun(pp, pid):
     return -res
 
 
-if __name__ == "__main__":
-
+def test_basic():
     # For this example, we pretend that we want to keep 'y' fixed at 1.0
     # while optimizing 'x' in the range -4.5 to 4.5
     space = {"x": [-4.5, 4.5]}
     problem_parameters = {"y": 1.0}
-
+    
     # Create an optimizer parameter set
     distgfs_params = {
         "opt_id": "distgfs_levi",
