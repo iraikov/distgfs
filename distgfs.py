@@ -925,9 +925,8 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             gfsopt.save_evals()
 
         if len(task_ids) > 0:
-            ret = controller.probe_next_result()
-
-            if ret is not None:
+            rets = controller.probe_all_next_results()
+            for ret in rets:
                 task_id, res = ret
                 gfsopt.update_result_value(task_id, res)
                 task_ids.remove(task_id)
