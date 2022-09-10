@@ -1,15 +1,43 @@
-import os, sys, importlib, logging, pprint, copy
+import copy
+import importlib
+import logging
+import os
+import sys
+import warnings
 from functools import partial
-import numpy as np
-import dlib
+
 import distwq
+import dlib
+import numpy as np
 
 try:
     import h5py
 except ImportError as e:
-    logger.warning(f"distgfs: unable to import h5py: {e}")
+    warnings.warn(
+        f"distgfs: unable to import h5py: {e}", category=warnings.ImportWarning
+    )
 
 gfsopt_dict = {}
+
+
+def validate_inputs(problem_parameters, space, save, file_path):
+
+    # Verify inputs
+    if file_path is None:
+        if problem_parameters is None or space is None:
+            raise ValueError(
+                "You must specify at least file name `file_path` or problem "
+                "parameters `problem_parameters` "
+                "along with a hyperparameter space `space`."
+            )
+        if save:
+            raise ValueError(
+                "If you want to save you must specify a file name `file_path`."
+            )
+    else:
+        if not os.path.isfile(file_path):
+            if problem_parameters is None or space is None:
+                raise FileNotFoundError(file_path)
 
 
 class DistGFSOptimizer:
@@ -58,19 +86,21 @@ class DistGFSOptimizer:
             function, including those not being optimized over. E.g: ``{'beta': 0.44}``.
             Can be an empty dict.
             Can include hyperparameters being optimized over, but does not need to.
-            If a hyperparameter is specified in both 'problem_parameters' and 'space', its value
-            in 'problem_parameters' will be overridden.
+            If a hyperparameter is specified in both 'problem_parameters' and 'space',
+            its value in 'problem_parameters' will be overridden.
         :param dict space: Hyperparameters to optimize over.
             Entries should be of the form:
             ``parameter: (Low_Bound, High_Bound)`` e.g:
             ``{'alpha': (0.65, 0.85), 'gamma': (1, 8)}``. If both bounds for a
             parameter are Ints, then only integers within the (inclusive) range
             will be sampled and tested.
-        :param func reduce_fun: function to reduce multiple results per evaluation obtained from each distributed worker.
-            Must take as argument a list of objective evaluations.
+        :param func reduce_fun: function to reduce multiple results per evaluation
+            obtained from each distributed worker. Must take as argument a list
+            of objective evaluations.
         :param int n_iter: (optional) Number of times to sample and test params.
         :param int save_iter: (optional) How often to save progress.
-        :param str file_path: (optional) File name for restoring and/or saving results and settings.
+        :param str file_path: (optional) File name for restoring
+            and/or saving results and settings.
         :param bool save: (optional) Save settings and progress periodically.
         :param float solver_epsilon: (optional) The accuracy to which local optima
             are determined before global exploration is resumed.
@@ -95,21 +125,7 @@ class DistGFSOptimizer:
         if self.verbose:
             self.logger.setLevel(logging.INFO)
 
-        # Verify inputs
-        if file_path is None:
-            if problem_parameters is None or space is None:
-                raise ValueError(
-                    "You must specify at least file name `file_path` or problem "
-                    "parameters `problem_parameters` along with a hyperparameter space `space`."
-                )
-            if save:
-                raise ValueError(
-                    "If you want to save you must specify a file name `file_path`."
-                )
-        else:
-            if not os.path.isfile(file_path):
-                if problem_parameters is None or space is None:
-                    raise FileNotFoundError(file_path)
+        validate_inputs(problem_parameters, space, save, file_path)
 
         eps = solver_epsilon
         noise_mag = relative_noise_magnitude
@@ -123,28 +139,27 @@ class DistGFSOptimizer:
                 lo_bounds.append(lo)
                 hi_bounds.append(hi)
         old_evals = {}
-        if file_path is not None:
-            if os.path.isfile(file_path):
-                (
-                    old_evals,
-                    old_feature_evals,
-                    old_constraint_evals,
-                    param_names,
-                    feature_dtypes,
-                    constraint_names,
-                    is_int,
-                    lo_bounds,
-                    hi_bounds,
-                    eps,
-                    noise_mag,
-                    problem_parameters,
-                    problem_ids,
-                ) = init_from_h5(file_path, param_names, opt_id, self.logger)
+        if (file_path is not None) and os.path.isfile(file_path):
+            (
+                old_evals,
+                old_feature_evals,
+                old_constraint_evals,
+                param_names,
+                feature_dtypes,
+                constraint_names,
+                is_int,
+                lo_bounds,
+                hi_bounds,
+                eps,
+                noise_mag,
+                problem_parameters,
+                problem_ids,
+            ) = init_from_h5(file_path, param_names, opt_id, self.logger)
 
         self.feature_dtypes = feature_dtypes
-        self.feature_names = None
-        if feature_dtypes is not None:
-            self.feature_names = [dtype[0] for dtype in feature_dtypes]
+        self.feature_names = (
+            None if feature_dtypes is None else [dtype[0] for dtype in feature_dtypes]
+        )
 
         self.constraint_names = constraint_names
 
@@ -303,6 +318,46 @@ class DistGFSOptimizer:
         else:
             res, prms = best_results
             self.logger.info(f"Best eval so far for: {res}@{prms}")
+
+    def update_result_value(self, task_id, res):
+
+        rres = res
+        if self.reduce_fun is not None:
+            rres = self.reduce_fun(res)
+
+        for problem_id in rres:
+
+            eval_req = self.evals[problem_id][task_id]
+            parameters = list(eval_req.x)
+            resval = None
+            feature = None
+            constraint = None
+            if (self.feature_names is None) and (self.constraint_names is None):
+                resval = rres[problem_id]
+            else:
+                resval = rres[problem_id][0]
+                if (self.feature_names is not None) and (
+                    self.constraint_names is not None
+                ):
+                    feature = rres[problem_id][1]
+                    constraint = rres[problem_id][2]
+                    self.feature_evals[problem_id].append((task_id, feature))
+                    self.constraint_evals[problem_id].append((task_id, constraint))
+                elif self.feature_names is not None:
+                    feature = rres[problem_id][1]
+                    self.feature_evals[problem_id].append((task_id, feature))
+                elif self.constraint_names is not None:
+                    constraint = rres[problem_id][1]
+                    self.constraint_evals[problem_id].append((task_id, constraint))
+
+            self.logger.info(
+                f"problem id {problem_id}: "
+                f"task id {task_id}: "
+                f"parameter coordinates {parameters}:{resval} "
+                f"{'' if feature is None else feature}"
+            )
+
+            eval_req.set(resval)
 
 
 def h5_get_group(h, groupname):
@@ -480,33 +535,30 @@ def h5_init_types(
 
 
 def h5_load_raw(input_file, opt_id):
-    ## N is number of trials
-    ## M is number of hyperparameters
+    # N is number of trials
+    # M is number of hyperparameters
     f = h5py.File(input_file, "r")
     opt_grp = h5_get_group(f, opt_id)
     solver_epsilon = opt_grp["solver_epsilon"][()]
     relative_noise_magnitude = opt_grp["relative_noise_magnitude"][()]
 
-    n_features = 0
     feature_names = None
     feature_types = None
     if "feature_enum" in opt_grp:
         feature_enum_dict = h5py.check_enum_dtype(opt_grp["feature_enum"].dtype)
         feature_idx_dict = {parm: idx for parm, idx in feature_enum_dict.items()}
         feature_name_dict = {idx: parm for parm, idx in feature_idx_dict.items()}
-        n_features = len(feature_enum_dict)
         feature_names = [
             feature_name_dict[spec[0]] for spec in iter(opt_grp["feature_spec"])
         ]
-        feature_dtype = opt_grp['feature_type'].dtype
+        feature_dtype = opt_grp["feature_type"].dtype
         feature_types = [feature_dtype.fields[x] for x in feature_dtype.fields]
-    n_constraints = 0
+
     constraint_names = None
     if "constraint_enum" in opt_grp:
         constraint_enum_dict = h5py.check_enum_dtype(opt_grp["constraint_enum"].dtype)
         constraint_idx_dict = {parm: idx for parm, idx in constraint_enum_dict.items()}
         constraint_name_dict = {idx: parm for parm, idx in constraint_idx_dict.items()}
-        n_constraints = len(constraint_enum_dict)
         constraint_names = [
             constraint_name_dict[spec[0]] for spec in iter(opt_grp["constraint_spec"])
         ]
@@ -647,7 +699,8 @@ def init_from_h5(file_path, param_names, opt_id, logger):
         n_old_evals = len(old_evals[problem_id])
         logger.info(
             f"Restored {n_old_evals} trials for problem {problem_id}, prev best: "
-            f"{prev_best[problem_id][0]}@{list(zip(saved_params, prev_best[problem_id][1]))}"
+            f"{prev_best[problem_id][0]}@"
+            f"{list(zip(saved_params, prev_best[problem_id][1]))}"
         )
     if (param_names is not None) and param_names != saved_params:
         # Switching params being optimized over would throw off Dlib.
@@ -856,10 +909,10 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
     if verbose:
         logger.setLevel(logging.INFO)
 
-    if gfsopt_params.get("n_max_tasks", None) is None:
+    n_max_tasks = gfsopt_params.get("n_max_tasks", None)
+    if (n_max_tasks is None) or (n_max_tasks < 1):
         gfsopt_params["n_max_tasks"] = distwq.n_workers
-    if gfsopt_params["n_max_tasks"] < 1:
-        gfsopt_params["n_max_tasks"] = distwq.n_workers
+
     gfsopt = gfsinit(gfsopt_params)
     logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
     iter_count = 0
@@ -875,45 +928,8 @@ def gfsctrl(controller, gfsopt_params, verbose=False):
             ret = controller.probe_next_result()
 
             if ret is not None:
-
                 task_id, res = ret
-
-                if gfsopt.reduce_fun is None:
-                    rres = res
-                else:
-                    rres = gfsopt.reduce_fun(res)
-
-                for problem_id in rres:
-                    eval_req = gfsopt.evals[problem_id][task_id]
-                    vals = list(eval_req.x)
-                    if (gfsopt.feature_names is None) and (
-                        gfsopt.constraint_names is None
-                    ):
-                        eval_req.set(rres[problem_id])
-                    else:
-                        eval_req.set(rres[problem_id][0])
-                        if (gfsopt.feature_names is not None) and (
-                            gfsopt.constraint_names is not None
-                        ):
-                            gfsopt.feature_evals[problem_id].append(
-                                (task_id, rres[problem_id][1])
-                            )
-                            gfsopt.constraint_evals[problem_id].append(
-                                (task_id, rres[problem_id][2])
-                            )
-                        elif gfsopt.feature_names is not None:
-                            gfsopt.feature_evals[problem_id].append(
-                                (task_id, rres[problem_id][1])
-                            )
-                        elif gfsopt.constraint_names is not None:
-                            gfsopt.constraint_evals[problem_id].append(
-                                (task_id, rres[problem_id][1])
-                            )
-
-                    logger.info(
-                        f"problem id {problem_id}: optimization iteration {iter_count}: parameter coordinates {vals}:{rres[problem_id]}"
-                    )
-
+                gfsopt.update_result_value(task_id, res)
                 task_ids.remove(task_id)
                 iter_count += 1
 
@@ -963,7 +979,7 @@ def run(
     max_workers=-1,
     nprocs_per_worker=1,
     spawn_executable=None,
-    spawn_args=[], 
+    spawn_args=[],
     verbose=False,
 ):
     if distwq.is_controller:

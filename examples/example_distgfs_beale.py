@@ -1,4 +1,6 @@
-import logging, distgfs
+import logging
+
+import distgfs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -6,8 +8,9 @@ logger = logging.getLogger(__name__)
 
 def beale(x, y):
     """
-    Beale's function (see https://en.wikipedia.org/wiki/Test_functions_for_optimization).
-    Has a global _minimum_ of 0 at x=3, y=0.5.
+     Beale's function
+    (see https://en.wikipedia.org/wiki/Test_functions_for_optimization).
+     Has a global _minimum_ of 0 at x=3, y=0.5.
     """
     a = (1.5 - x + x * y) ** 2
     b = (2.25 - x + x * y * y) ** 2

@@ -1,5 +1,9 @@
-import math, logging, distgfs, pickle
+import logging
+import math
+
 import numpy as np
+
+import distgfs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
