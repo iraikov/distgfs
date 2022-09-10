@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import distwq
 import dlib
@@ -43,26 +44,26 @@ def validate_inputs(problem_parameters, space, save, file_path):
 class DistGFSOptimizer:
     def __init__(
         self,
-        opt_id,
-        obj_fun,
-        reduce_fun=None,
-        problem_ids=None,
-        problem_parameters=None,
-        space=None,
-        feature_dtypes=None,
-        constraint_names=None,
-        solver_epsilon=None,
-        relative_noise_magnitude=None,
-        seed=None,
-        n_iter=100,
-        n_max_tasks=-1,
-        save_iter=10,
-        file_path=None,
-        save=False,
-        metadata=None,
-        verbose=False,
+        opt_id: str,
+        obj_fun: Callable,
+        reduce_fun: Optional[Callable] = None,
+        problem_ids: Optional[List[int]] = None,
+        problem_parameters: Optional[Dict[str, float]] = None,
+        space: Optional[Dict[str, List[float]]] = None,
+        feature_dtypes: Optional[List[Tuple[str, Any]]] = None,
+        constraint_names: Optional[List[str]] = None,
+        solver_epsilon: Optional[float] = None,
+        relative_noise_magnitude: Optional[float] = None,
+        seed: Optional[Any] = None,
+        n_iter: int = 100,
+        n_max_tasks: int = -1,
+        save_iter: int = 10,
+        file_path: Optional[str] = None,
+        save: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         """`Creates an optimizer based on the Global Function Search
         <http://dlib.net/optimization.html#global_function_search>`_
         (GFS) optimizer in dlib. Supports distributed optimization
@@ -297,7 +298,7 @@ class DistGFSOptimizer:
 
         self.n_saved_evals += len(finished_evals[next(iter(self.problem_ids))])
 
-    def get_best(self):
+    def get_best(self) -> Tuple[List[Tuple[str, float]], float]:
         best_results = {}
         for problem_id in self.problem_ids:
             best_eval = self.optimizer_dict[problem_id].get_best_function_eval()
@@ -309,7 +310,7 @@ class DistGFSOptimizer:
         else:
             return best_results[problem_id]
 
-    def print_best(self):
+    def print_best(self) -> None:
         best_results = self.get_best()
         if self.has_problem_ids:
             for problem_id in self.problem_ids:
@@ -837,7 +838,15 @@ def save_to_h5(
     f.close()
 
 
-def eval_obj_fun_sp(obj_fun, pp, space_params, is_int, problem_id, i, space_vals):
+def eval_obj_fun_sp(
+    obj_fun: Callable,
+    pp: Dict[str, float],
+    space_params: List[str],
+    is_int: List[bool],
+    problem_id: int,
+    i: int,
+    space_vals: Dict[int, List[float]],
+) -> Dict[int, float]:
     """
     Objective function evaluation (single problem).
     """
@@ -867,7 +876,11 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     return result_dict
 
 
-def gfsinit(gfsopt_params, worker=None, verbose=False):
+def gfsinit(
+    gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
+    worker: Optional[int] = None,
+    verbose: bool = False,
+) -> DistGFSOptimizer:
     objfun = None
     objfun_module = gfsopt_params.get("obj_fun_module", "__main__")
     objfun_name = gfsopt_params.get("obj_fun_name", None)
@@ -903,7 +916,11 @@ def gfsinit(gfsopt_params, worker=None, verbose=False):
     return gfsopt
 
 
-def gfsctrl(controller, gfsopt_params, verbose=False):
+def gfsctrl(
+    controller: distwq.MPIController,
+    gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
+    verbose: bool = False,
+) -> None:
     """Controller for distributed GFS optimization."""
     logger = logging.getLogger(gfsopt_params["opt_id"])
     if verbose:
@@ -965,22 +982,22 @@ def gfswork(worker, gfsopt_params, verbose=False):
     gfsinit(gfsopt_params, worker=worker, verbose=verbose)
 
 
-def eval_fun(opt_id, *args):
+def eval_fun(opt_id: str, *args) -> Dict[int, float]:
     return gfsopt_dict[opt_id].eval_fun(*args)
 
 
 def run(
-    gfsopt_params,
-    collective_mode="gather",
-    spawn_workers=False,
-    sequential_spawn=False,
-    spawn_startup_wait=None,
-    max_workers=-1,
-    nprocs_per_worker=1,
-    spawn_executable=None,
-    spawn_args=[],
-    verbose=False,
-):
+    gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
+    collective_mode: str = "gather",
+    spawn_workers: bool = False,
+    sequential_spawn: bool = False,
+    spawn_startup_wait: None = None,
+    max_workers: int = -1,
+    nprocs_per_worker: int = 1,
+    spawn_executable: None = None,
+    spawn_args: List[Any] = [],
+    verbose: bool = False,
+) -> Tuple[List[Tuple[str, float]], float]:
     if distwq.is_controller:
         distwq.run(
             fun_name="gfsctrl",
