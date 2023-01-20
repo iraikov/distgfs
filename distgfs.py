@@ -918,6 +918,16 @@ def gfsinit(
                 objfun_init_name, sys.modules[objfun_init_module].__dict__
             )
             objfun = objfun_init(**objfun_init_args, worker=worker)
+    else:
+        ctrl_init_fun_module = gfsopt_params.get("controller_init_fun_module", "__main__")
+        ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
+        ctrl_init_fun_args = gfsopt_params.get("controller_init_fun_args", {})
+        if ctrl_init_fun_module not in sys.modules:
+            importlib.import_module(ctrl_init_fun_module)
+        ctrl_init_fun = eval(
+            ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
+        )
+        ctrl_init_fun(**ctrl_init_fun_args)
 
     gfsopt_params["obj_fun"] = objfun
     reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
@@ -1043,6 +1053,7 @@ def run(
             ),
             max_workers=max_workers,
             worker_grouping_method="spawn" if spawn_workers else "split",
+            broker_is_worker=True,
             sequential_spawn=sequential_spawn,
             spawn_startup_wait=spawn_startup_wait,
             spawn_executable=spawn_executable,
@@ -1062,6 +1073,7 @@ def run(
         distwq.run(
             fun_name="gfswork",
             module_name="distgfs",
+            broker_is_worker=True,
             broker_fun_name=gfsopt_params.get("broker_fun_name", None),
             broker_module_name=gfsopt_params.get("broker_module_name", None),
             verbose=verbose,
