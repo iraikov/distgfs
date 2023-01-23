@@ -57,6 +57,7 @@ class DistGFSOptimizer:
         opt_id: str,
         obj_fun: Callable,
         reduce_fun: Optional[Callable] = None,
+        reduce_fun_args: Optional[Dict[str, Any]] = None,
         problem_ids: Optional[List[int]] = None,
         problem_parameters: Optional[Dict[str, float]] = None,
         space: Optional[Dict[str, List[float]]] = None,
@@ -239,6 +240,9 @@ class DistGFSOptimizer:
             )
 
         self.reduce_fun = reduce_fun
+        self.reduce_fun_args = {}
+        if reduce_fun_args is not None:
+            self.reduce_fun_args = reduce_fun_args
 
         self.evals = {problem_id: {} for problem_id in problem_ids}
         self.feature_evals = None
@@ -336,8 +340,7 @@ class DistGFSOptimizer:
 
         rres = res
         if self.reduce_fun is not None:
-            rres = self.reduce_fun(res)
-
+            rres = self.reduce_fun(res, **self.reduce_fun_args)
         for problem_id in rres:
 
             eval_req = self.evals[problem_id][task_id]
@@ -434,7 +437,7 @@ def h5_init_types(
     objective_mapping = {name: idx for (idx, name) in enumerate(objective_names)}
     dt = h5py.enum_dtype(objective_mapping, basetype=np.uint16)
     opt_grp["objective_enum"] = dt
-    dt = np.dtype({"names": objective_names, "formats": [np.float]})
+    dt = np.dtype({"names": objective_names, "formats": [np.float32]})
     opt_grp["objective_type"] = dt
     dt = np.dtype([("objective", opt_grp["objective_enum"])])
     opt_grp["objective_spec_type"] = dt
@@ -497,7 +500,7 @@ def h5_init_types(
     dt = h5py.enum_dtype(param_mapping, basetype=np.uint16)
     opt_grp["parameter_enum"] = dt
 
-    dt = np.dtype([("parameter", opt_grp["parameter_enum"]), ("value", np.float)])
+    dt = np.dtype([("parameter", opt_grp["parameter_enum"]), ("value", np.float32)])
     opt_grp["problem_parameters_type"] = dt
 
     dset = h5_get_dataset(
@@ -517,16 +520,16 @@ def h5_init_types(
     dt = np.dtype(
         [
             ("parameter", opt_grp["parameter_enum"]),
-            ("is_integer", np.bool),
-            ("lower", np.float),
-            ("upper", np.float),
+            ("is_integer", bool),
+            ("lower", np.float32),
+            ("upper", np.float32),
         ]
     )
     opt_grp["parameter_spec_type"] = dt
 
-    is_integer = np.asarray(spec.is_integer_variable, dtype=np.bool)
-    upper = np.asarray(spec.upper, dtype=np.float)
-    lower = np.asarray(spec.lower, dtype=np.float)
+    is_integer = np.asarray(spec.is_integer_variable, dtype=bool)
+    upper = np.asarray(spec.upper, dtype=np.float32)
+    lower = np.asarray(spec.lower, dtype=np.float32)
 
     dset = h5_get_dataset(
         opt_grp,
@@ -545,7 +548,7 @@ def h5_init_types(
         a[idx]["upper"] = hi
     dset[:] = a
 
-    dt = np.dtype({"names": param_names, "formats": [np.float] * len(param_names)})
+    dt = np.dtype({"names": param_names, "formats": [np.float32] * len(param_names)})
     opt_grp["parameter_space_type"] = dt
 
 
@@ -928,15 +931,16 @@ def gfsinit(
             ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
         )
         ctrl_init_fun(**ctrl_init_fun_args)
-
+        reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
+        reducefun_name = gfsopt_params.get("reduce_fun_name", None)
+        reducefun_args = gfsopt_params.get("reduce_fun_args", {})
+        if reducefun_module not in sys.modules:
+            importlib.import_module(reducefun_module)
+        if reducefun_name is not None:
+            reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
+            gfsopt_params["reduce_fun"] = reducefun
+            gfsopt_params["reduce_fun_args"] = reducefun_args
     gfsopt_params["obj_fun"] = objfun
-    reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
-    reducefun_name = gfsopt_params.get("reduce_fun_name", None)
-    if reducefun_module not in sys.modules:
-        importlib.import_module(reducefun_module)
-    if reducefun_name is not None:
-        reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
-        gfsopt_params["reduce_fun"] = reducefun
     gfsopt = DistGFSOptimizer(**gfsopt_params, verbose=verbose)
     gfsopt_dict[gfsopt.opt_id] = gfsopt
     return gfsopt
