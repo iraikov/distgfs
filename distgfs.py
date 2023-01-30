@@ -798,7 +798,7 @@ def save_to_h5(
         opt_grp["solver_epsilon"] = solver_epsilon
         opt_grp["relative_noise_magnitude"] = relative_noise_magnitude
         if has_problem_ids:
-            opt_grp["problem_ids"] = np.asarray(list(problem_ids), dtype=np.int)
+            opt_grp["problem_ids"] = np.asarray(list(problem_ids), dtype=np.int32)
 
     opt_grp = h5_get_group(f, opt_id)
     for problem_id in problem_ids:
