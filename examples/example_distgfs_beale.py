@@ -28,7 +28,6 @@ def obj_fun(pp, pid):
 
 
 if __name__ == "__main__":
-
     # For this example, we pretend that we want to keep 'y' fixed at 0.5
     # while optimizing 'x' in the range -4.5 to 4.5
     space = {"x": [-4.5, 4.5]}

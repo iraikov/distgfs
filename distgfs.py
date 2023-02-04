@@ -32,7 +32,6 @@ def validate_inputs(
     save: bool,
     file_path: Optional[str],
 ) -> None:
-
     # Verify inputs
     if file_path is None:
         if problem_parameters is None or space is None:
@@ -57,14 +56,14 @@ class DistGFSOptimizer:
         opt_id: str,
         obj_fun: Callable,
         reduce_fun: Optional[Callable] = None,
-        reduce_fun_args: Optional[Dict[str, Any]] = None,
+        reduce_fun_args: Dict[str, Any] = dict(),
         problem_ids: Optional[List[int]] = None,
         problem_parameters: Optional[Dict[str, float]] = None,
         space: Optional[Dict[str, List[float]]] = None,
         feature_dtypes: Optional[List[Tuple[str, Any]]] = None,
         constraint_names: Optional[List[str]] = None,
-        solver_epsilon: Optional[float] = None,
-        relative_noise_magnitude: Optional[float] = None,
+        solver_epsilon: float = 0.0005,
+        relative_noise_magnitude: float = 0.001,
         seed: Optional[Any] = None,
         n_iter: int = 100,
         n_max_tasks: int = -1,
@@ -175,8 +174,6 @@ class DistGFSOptimizer:
 
         self.constraint_names = constraint_names
 
-        eps = 0.0005 if eps is None else eps
-        noise_mag = 0.001 if noise_mag is None else noise_mag
         spec = dlib.function_spec(bound1=lo_bounds, bound2=hi_bounds, is_integer=is_int)
 
         has_problem_ids = problem_ids is not None
@@ -240,9 +237,7 @@ class DistGFSOptimizer:
             )
 
         self.reduce_fun = reduce_fun
-        self.reduce_fun_args = {}
-        if reduce_fun_args is not None:
-            self.reduce_fun_args = reduce_fun_args
+        self.reduce_fun_args = reduce_fun_args
 
         self.evals = {problem_id: {} for problem_id in problem_ids}
         self.feature_evals = None
@@ -337,12 +332,10 @@ class DistGFSOptimizer:
     def update_result_value(
         self, task_id: int, res: Dict[int, Tuple[float, ndarray]]
     ) -> None:
-
         rres = res
         if self.reduce_fun is not None:
             rres = self.reduce_fun(res, **self.reduce_fun_args)
         for problem_id in rres:
-
             eval_req = self.evals[problem_id][task_id]
             parameters = list(eval_req.x)
             resval = None
@@ -412,7 +405,6 @@ def h5_init_types(
     spec: function_spec,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-
     opt_grp = h5_get_group(f, opt_id)
 
     param_keys = set(param_names)
@@ -922,7 +914,9 @@ def gfsinit(
             )
             objfun = objfun_init(**objfun_init_args, worker=worker)
     else:
-        ctrl_init_fun_module = gfsopt_params.get("controller_init_fun_module", "__main__")
+        ctrl_init_fun_module = gfsopt_params.get(
+            "controller_init_fun_module", "__main__"
+        )
         ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
         ctrl_init_fun_args = gfsopt_params.get("controller_init_fun_args", {})
         if ctrl_init_fun_module not in sys.modules:
