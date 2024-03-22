@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "distgfs"
-version = "1.1.0"
+version = "1.2.0"
 description = "Distributed global function search via dlib"
 authors = ["Ivan Raikov <ivan.g.raikov@gmail.com>"]
 license = "GPL-3.0-or-later"

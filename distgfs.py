@@ -146,7 +146,7 @@ class DistGFSOptimizer:
             for parm, conf in space.items():
                 param_names.append(parm)
                 lo, hi = conf
-                is_int.append(type(lo) == int and type(hi) == int)
+                is_int.append(isinstance(lo, int) and isinstance(hi, int))
                 lo_bounds.append(lo)
                 hi_bounds.append(hi)
         old_evals = {}
@@ -919,12 +919,13 @@ def gfsinit(
         )
         ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
         ctrl_init_fun_args = gfsopt_params.get("controller_init_fun_args", {})
-        if ctrl_init_fun_module not in sys.modules:
-            importlib.import_module(ctrl_init_fun_module)
-        ctrl_init_fun = eval(
-            ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
-        )
-        ctrl_init_fun(**ctrl_init_fun_args)
+        if ctrl_init_fun_name is not None:
+            if ctrl_init_fun_module not in sys.modules:
+                importlib.import_module(ctrl_init_fun_module)
+                ctrl_init_fun = eval(
+                    ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
+                )
+            ctrl_init_fun(**ctrl_init_fun_args)
         reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
         reducefun_name = gfsopt_params.get("reduce_fun_name", None)
         reducefun_args = gfsopt_params.get("reduce_fun_args", {})
