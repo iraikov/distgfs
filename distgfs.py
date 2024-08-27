@@ -1,4 +1,5 @@
 import copy
+import pprint
 import importlib
 import logging
 import os
@@ -1069,10 +1070,11 @@ def run(
             del gfsopt_params["file_path"]
         if "save" in gfsopt_params:
             del gfsopt_params["save"]
+
         distwq.run(
             fun_name="gfswork",
             module_name="distgfs",
-            broker_is_worker=True,
+            broker_is_worker=not spawn_workers,
             broker_fun_name=gfsopt_params.get("broker_fun_name", None),
             broker_module_name=gfsopt_params.get("broker_module_name", None),
             verbose=verbose,
