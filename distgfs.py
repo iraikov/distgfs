@@ -922,9 +922,9 @@ def gfsinit(
         if ctrl_init_fun_name is not None:
             if ctrl_init_fun_module not in sys.modules:
                 importlib.import_module(ctrl_init_fun_module)
-                ctrl_init_fun = eval(
-                    ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
-                )
+            ctrl_init_fun = eval(
+                ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
+            )
             ctrl_init_fun(**ctrl_init_fun_args)
         reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
         reducefun_name = gfsopt_params.get("reduce_fun_name", None)
