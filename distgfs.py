@@ -429,7 +429,9 @@ def h5_init_types(
     objective_mapping = {name: idx for (idx, name) in enumerate(objective_names)}
     dt = h5py.enum_dtype(objective_mapping, basetype=np.uint16)
     opt_grp["objective_enum"] = dt
-    dt = np.dtype({"names": objective_names, "formats": [np.float32]})
+    # Store objectives as float64; dlib's global_function_search works in double
+    # precision throughout.
+    dt = np.dtype({"names": objective_names, "formats": [np.float64]})
     opt_grp["objective_type"] = dt
     dt = np.dtype([("objective", opt_grp["objective_enum"])])
     opt_grp["objective_spec_type"] = dt
@@ -671,6 +673,19 @@ def h5_load_all(file_path, opt_id):
     for problem_id in raw_problem_results:
         raw_results = raw_problem_results[problem_id]
         ys = raw_results["objectives"]["y"]
+        # checkpoints written by older versions objective values as float32.
+        # Upcast explicitly so that dlib receives doubles and Lipschitz-bound
+        # estimates are not degraded.
+        if ys.dtype == np.float32:
+            warnings.warn(
+                f"Checkpoint for opt_id '{opt_id}' stores objective values as "
+                "float32 (written by an older version of distgfs).  Values are "
+                "being upcast to float64; precision is limited for these "
+                "restored evaluations.",
+                UserWarning,
+                stacklevel=3,
+            )
+            ys = ys.astype(np.float64)
         xs = raw_results["parameters"]
         fs = None
         cs = None
