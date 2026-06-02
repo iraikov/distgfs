@@ -7,6 +7,8 @@ import warnings
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
+ProblemId = Union[int, str]
+
 import distwq
 import dlib
 import numpy as np
@@ -57,7 +59,7 @@ class DistGFSOptimizer:
         obj_fun: Callable,
         reduce_fun: Optional[Callable] = None,
         reduce_fun_args: Dict[str, Any] = dict(),
-        problem_ids: Optional[List[int]] = None,
+        problem_ids: Optional[List[ProblemId]] = None,
         problem_parameters: Optional[Dict[str, float]] = None,
         space: Optional[Dict[str, List[float]]] = None,
         feature_dtypes: Optional[List[Tuple[str, Any]]] = None,
@@ -330,7 +332,7 @@ class DistGFSOptimizer:
             self.logger.info(f"Best eval so far for: {res}@{prms}")
 
     def update_result_value(
-        self, task_id: int, res: Dict[int, Tuple[float, ndarray]]
+        self, task_id: int, res: Dict[ProblemId, Tuple[float, ndarray]]
     ) -> None:
         rres = res
         if self.reduce_fun is not None:
@@ -589,7 +591,19 @@ def h5_load_raw(input_file, opt_id):
 
     problem_ids = None
     if "problem_ids" in opt_grp:
-        problem_ids = set(opt_grp["problem_ids"])
+        raw_ids = opt_grp["problem_ids"][:]
+        problem_ids = set()
+        for pid in raw_ids:
+            if isinstance(pid, (int, np.integer)):
+                # Backward compat: old files stored problem_ids as int32.
+                problem_ids.add(int(pid))
+            else:
+                pid_str = pid.decode("utf-8") if isinstance(pid, bytes) else str(pid)
+                try:
+                    # "0", "1" etc. round-trip back to int for backward compat.
+                    problem_ids.add(int(pid_str))
+                except ValueError:
+                    problem_ids.add(pid_str)
 
     raw_results = {}
     for problem_id in problem_ids if problem_ids is not None else [0]:
@@ -766,7 +780,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
 
 def save_to_h5(
     opt_id: str,
-    problem_ids: Set[int],
+    problem_ids: Set[ProblemId],
     has_problem_ids: bool,
     feature_dtypes: List[
         Union[Tuple[str, Tuple[Type[int], int]], Tuple[str, Tuple[Type[float], int]]]
@@ -774,9 +788,9 @@ def save_to_h5(
     constraint_names: Optional[List[str]],
     param_names: List[str],
     spec: function_spec,
-    evals: Dict[int, List[function_evaluation]],
-    feature_evals: Dict[int, List[ndarray]],
-    constraint_evals: Optional[Dict[int, List[ndarray]]],
+    evals: Dict[ProblemId, List[function_evaluation]],
+    feature_evals: Dict[ProblemId, List[ndarray]],
+    constraint_evals: Optional[Dict[ProblemId, List[ndarray]]],
     solver_epsilon: float,
     relative_noise_magnitude: float,
     problem_parameters: Dict[str, float],
@@ -805,7 +819,12 @@ def save_to_h5(
         opt_grp["solver_epsilon"] = solver_epsilon
         opt_grp["relative_noise_magnitude"] = relative_noise_magnitude
         if has_problem_ids:
-            opt_grp["problem_ids"] = np.asarray(list(problem_ids), dtype=np.int32)
+            dt = h5py.string_dtype(encoding="utf-8")
+            opt_grp.create_dataset(
+                "problem_ids",
+                data=np.array([str(pid) for pid in problem_ids], dtype=object),
+                dtype=dt,
+            )
 
     opt_grp = h5_get_group(f, opt_id)
     for problem_id in problem_ids:
@@ -869,10 +888,10 @@ def eval_obj_fun_sp(
     pp: Dict[str, float],
     space_params: List[str],
     is_int: List[bool],
-    problem_id: int,
+    problem_id: ProblemId,
     i: int,
-    space_vals: Dict[int, List[float]],
-) -> Dict[int, float]:
+    space_vals: Dict[ProblemId, List[float]],
+) -> Dict[ProblemId, float]:
     """
     Objective function evaluation (single problem).
     """
@@ -1040,7 +1059,7 @@ def gfswork(
     gfsinit(gfsopt_params, worker=worker, verbose=verbose)
 
 
-def eval_fun(opt_id: str, *args) -> Dict[int, float]:
+def eval_fun(opt_id: str, *args) -> Dict[ProblemId, float]:
     return gfsopt_dict[opt_id].eval_fun(*args)
 
 
