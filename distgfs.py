@@ -337,9 +337,21 @@ class DistGFSOptimizer:
     def update_result_value(
         self, task_id: int, res: Dict[ProblemId, Tuple[float, ndarray]]
     ) -> None:
-        rres = res
-        if self.reduce_fun is not None:
-            rres = self.reduce_fun(res, **self.reduce_fun_args)
+        if isinstance(res, list):
+            # MPICollectiveBroker path: res is a list with one entry per
+            # contributing sub-worker rank.  reduce_fun, when provided, is
+            # responsible for merging the list into a single result dict
+            # (e.g. averaging across replicates).  Without reduce_fun the
+            # first element is used, which is correct for nprocs_per_worker=1.
+            rres = (
+                self.reduce_fun(res, **self.reduce_fun_args)
+                if self.reduce_fun is not None
+                else res[0]
+            )
+        else:
+            # Plain MPIWorker or no-MPI path: res is the raw result dict.
+            # reduce_fun is not called here - there is nothing to reduce.
+            rres = res
         for problem_id in rres:
             eval_req = self.evals[problem_id][task_id]
             parameters = list(eval_req.x)
