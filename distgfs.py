@@ -343,11 +343,16 @@ class DistGFSOptimizer:
             # responsible for merging the list into a single result dict
             # (e.g. averaging across replicates).  Without reduce_fun the
             # first element is used, which is correct for nprocs_per_worker=1.
-            rres = (
-                self.reduce_fun(res, **self.reduce_fun_args)
-                if self.reduce_fun is not None
-                else res[0]
-            )
+            if self.reduce_fun is not None:
+                rres = self.reduce_fun(res, **self.reduce_fun_args)
+            elif len(res) == 1:
+                rres = res[0]
+            else:
+                raise ValueError(
+                    f"update_result_value: task {task_id} returned "
+                    f"{len(res)} sub-worker results but no reduce_fun "
+                    "is specified. Provide reduce_fun to merge them."
+                )
         else:
             # Plain MPIWorker or no-MPI path: res is the raw result dict.
             # reduce_fun is not called here - there is nothing to reduce.
