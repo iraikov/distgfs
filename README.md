@@ -1,17 +1,23 @@
 # distgfs
 
 Distributed computing framework for the
-[Global Function Search](http://dlib.net/optimization.html#global_function_search) 
+[Global Function Search](http://dlib.net/optimization.html#global_function_search)
 (GFS) hyperparameter optimizer from the [Dlib](http://dlib.net) library.
 Based on [gfsopt](https://github.com/tsoernes/gfsopt).
 
 Provides the following features:
 * Parallel optimization: Run distributed hyperparameter searches via [mpi4py](https://github.com/mpi4py/mpi4py).
-* Save and restore progress: Save/restore settings, parameters and optimization progress to/from HDF5 file. 
+* Save and restore progress: Save/restore settings, parameters and optimization progress to/from HDF5 file.
 * Average over multiple runs: Run a stochastic objective function using the same
 parameters multiple times and report the average to Dlib's Global Function
 Search. Useful in highly stochastic domains to avoid biasing the search towards
 lucky runs.
+* Multi-problem mode: Optimise a set of related problems simultaneously using
+independent GFS instances, one per problem id. Set `problem_ids` in
+`gfsopt_params` to activate. By default all K problems are bundled into a single
+worker task per iteration. Set `per_problem_tasks: True` to dispatch one task
+per problem instead, enabling up to `max(workers, K)` concurrent simulations and
+genuine throughput scaling with the number of MPI ranks.
 
 For theoretical background of GFS, see ['A Global Optimization Algorithm Worth Using'](http://blog.dlib.net/2017/12/a-global-optimization-algorithm-worth.html) and [Malherbe & Vayatis 2017: Global optimization of Lipschitz functions](https://arxiv.org/abs/1703.02628)
 
@@ -47,7 +53,7 @@ def obj_fun(pp, pid):
 # while optimizing 'x' in the range -4.5 to 4.5
 space = {'x': [-4.5, 4.5]}
 problem_parameters = {'y': 1.}
-    
+
 # Create an optimizer parameter set
 distgfs_params = {'opt_id': 'distgfs_levi',
                   'obj_fun_name': 'obj_fun',

@@ -251,6 +251,9 @@ class DistGFSOptimizer:
 
         self.has_problem_ids = has_problem_ids
         self.problem_ids = problem_ids
+        self.per_problem_tasks = has_problem_ids and kwargs.get(
+            "per_problem_tasks", False
+        )
 
     def save_evals(self) -> None:
         """Store results of finished evals to file; print best eval"""
@@ -910,7 +913,7 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     """
 
     mpp = {}
-    for problem_id in problem_ids:
+    for problem_id in space_vals:
         this_pp = copy.deepcopy(pp)
         this_space_vals = space_vals[problem_id]
         for j, key in enumerate(space_params):
@@ -975,22 +978,9 @@ def gfsinit(
     return gfsopt
 
 
-def gfsctrl(
-    controller: distwq.MPIController,
-    gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
-    verbose: bool = False,
+def _gfsctrl_all_problems(
+    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
 ) -> None:
-    """Controller for distributed GFS optimization."""
-    logger = logging.getLogger(gfsopt_params["opt_id"])
-    if verbose:
-        logger.setLevel(logging.INFO)
-
-    n_max_tasks = gfsopt_params.get("n_max_tasks", None)
-    if (n_max_tasks is None) or (n_max_tasks < 1):
-        gfsopt_params["n_max_tasks"] = distwq.n_workers
-
-    gfsopt = gfsinit(gfsopt_params)
-    logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
     iter_count = 0
     task_ids = []
     n_tasks = 0
@@ -1031,6 +1021,75 @@ def gfsctrl(
                 for problem_id in gfsopt.problem_ids:
                     gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
 
+
+def _gfsctrl_per_problem(
+    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
+) -> None:
+    problem_ids = gfsopt.problem_ids
+    n_iter = gfsopt.n_iter
+    n_max_tasks = gfsopt.n_max_tasks
+
+    iter_counts = {pid: 0 for pid in problem_ids}
+    n_submitted = {pid: 0 for pid in problem_ids}
+    task_to_pid: Dict[int, ProblemId] = {}
+    in_flight: List[int] = []
+    pid_cycle = list(problem_ids)
+
+    while any(iter_counts[pid] < n_iter for pid in problem_ids):
+        controller.process()
+
+        total_done = sum(iter_counts.values())
+        if gfsopt.save and total_done > 0 and (total_done % gfsopt.save_iter == 0):
+            gfsopt.save_evals()
+
+        for task_id, res in controller.probe_all_next_results():
+            pid = task_to_pid.pop(task_id)
+            gfsopt.update_result_value(task_id, res)
+            in_flight.remove(task_id)
+            iter_counts[pid] += 1
+
+        for pid in pid_cycle:
+            if n_submitted[pid] >= n_iter:
+                continue
+            if len(in_flight) >= n_max_tasks:
+                break
+            eval_req = gfsopt.optimizer_dict[pid].get_next_x()
+            vals_dict = {pid: list(eval_req.x)}
+            task_id = controller.submit_call(
+                "eval_fun",
+                module_name="distgfs",
+                args=(gfsopt.opt_id, n_submitted[pid], vals_dict),
+            )
+            task_to_pid[task_id] = pid
+            in_flight.append(task_id)
+            gfsopt.evals[pid][task_id] = eval_req
+            n_submitted[pid] += 1
+
+
+def gfsctrl(
+    controller: distwq.MPIController,
+    gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
+    verbose: bool = False,
+) -> None:
+    """Controller for distributed GFS optimization."""
+    logger = logging.getLogger(gfsopt_params["opt_id"])
+    if verbose:
+        logger.setLevel(logging.INFO)
+
+    n_max_tasks = gfsopt_params.get("n_max_tasks", None)
+    if (n_max_tasks is None) or (n_max_tasks < 1):
+        if gfsopt_params.get("per_problem_tasks", False):
+            _pids = gfsopt_params.get("problem_ids", set())
+            gfsopt_params["n_max_tasks"] = max(distwq.n_workers, len(_pids))
+        else:
+            gfsopt_params["n_max_tasks"] = distwq.n_workers
+
+    gfsopt = gfsinit(gfsopt_params)
+    logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
+    if gfsopt.per_problem_tasks:
+        _gfsctrl_per_problem(controller, gfsopt)
+    else:
+        _gfsctrl_all_problems(controller, gfsopt)
     if gfsopt.save:
         gfsopt.save_evals()
     controller.info()
