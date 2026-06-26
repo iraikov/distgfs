@@ -182,9 +182,9 @@ class DistGFSOptimizer:
         if not has_problem_ids:
             problem_ids = set([0])
 
-        n_saved_evals = 0
-        n_saved_features = 0
-        n_saved_constraints = 0
+        n_saved_evals = {pid: 0 for pid in problem_ids}
+        n_saved_features = {pid: 0 for pid in problem_ids}
+        n_saved_constraints = {pid: 0 for pid in problem_ids}
         optimizer_dict = {}
         for problem_id in problem_ids:
             if problem_id in old_evals:
@@ -193,7 +193,7 @@ class DistGFSOptimizer:
                     initial_function_evals=[old_evals[problem_id]],
                     relative_noise_magnitude=noise_mag,
                 )
-                n_saved_evals = len(old_evals[problem_id])
+                n_saved_evals[problem_id] = len(old_evals[problem_id])
             else:
                 optimizer = dlib.global_function_search([spec])
                 optimizer.set_relative_noise_magnitude(noise_mag)
@@ -259,38 +259,44 @@ class DistGFSOptimizer:
         """Store results of finished evals to file; print best eval"""
         finished_feature_evals = None
         finished_constraint_evals = None
-        eval_offset = self.n_saved_evals
         finished_evals = {
             problem_id: self.optimizer_dict[problem_id].get_function_evaluations()[1][
                 0
-            ][eval_offset:]
+            ][self.n_saved_evals[problem_id] :]
             for problem_id in self.problem_ids
         }
         if self.feature_dtypes is not None:
-            feature_offset = self.n_saved_features
             finished_feature_evals = {
-                problem_id: list(
-                    [x[1] for x in self.feature_evals[problem_id][feature_offset:]]
-                )
-                for problem_id in self.problem_ids
-            }
-            self.n_saved_features += len(
-                finished_feature_evals[next(iter(self.problem_ids))]
-            )
-        if self.constraint_names is not None:
-            constraint_offset = self.n_saved_constraints
-            finished_constraint_evals = {
                 problem_id: list(
                     [
                         x[1]
-                        for x in self.constraint_evals[problem_id][constraint_offset:]
+                        for x in self.feature_evals[problem_id][
+                            self.n_saved_features[problem_id] :
+                        ]
                     ]
                 )
                 for problem_id in self.problem_ids
             }
-            self.n_saved_constraints += len(
-                finished_constraint_evals[next(iter(self.problem_ids))]
-            )
+            for problem_id in self.problem_ids:
+                self.n_saved_features[problem_id] += len(
+                    finished_feature_evals[problem_id]
+                )
+        if self.constraint_names is not None:
+            finished_constraint_evals = {
+                problem_id: list(
+                    [
+                        x[1]
+                        for x in self.constraint_evals[problem_id][
+                            self.n_saved_constraints[problem_id] :
+                        ]
+                    ]
+                )
+                for problem_id in self.problem_ids
+            }
+            for problem_id in self.problem_ids:
+                self.n_saved_constraints[problem_id] += len(
+                    finished_constraint_evals[problem_id]
+                )
         save_to_h5(
             self.opt_id,
             self.problem_ids,
@@ -310,7 +316,8 @@ class DistGFSOptimizer:
             self.logger,
         )
 
-        self.n_saved_evals += len(finished_evals[next(iter(self.problem_ids))])
+        for problem_id in self.problem_ids:
+            self.n_saved_evals[problem_id] += len(finished_evals[problem_id])
 
     def get_best(self) -> Tuple[List[Tuple[str, float]], float]:
         best_results = {}
