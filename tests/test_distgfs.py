@@ -2,7 +2,10 @@ import math
 import os
 import tempfile
 
+import dlib
 import h5py
+import pytest
+
 import distgfs
 
 
@@ -196,3 +199,143 @@ def test_string_problem_ids():
     finally:
         if os.path.exists(fpath):
             os.unlink(fpath)
+
+
+def test_initial_evals_seed_fresh_run():
+    """initial_evals seeds a fresh (non-resumed) run; best result never
+    regresses below the seeded point, which is the true optimum here."""
+    space = {"x": [-4.5, 4.5]}
+    problem_parameters = {"y": 1.0}
+    seed_x = 1.0 / 0.4
+    distgfs_params = {
+        "opt_id": "distgfs_levi_seed",
+        "obj_fun_name": "obj_fun",
+        "obj_fun_module": "test_distgfs",
+        "problem_parameters": problem_parameters,
+        "space": space,
+        "n_iter": 3,
+        "n_max_tasks": 1,
+        "initial_evals": {0: [dlib.function_evaluation(x=[seed_x], y=0.0)]},
+    }
+
+    params, val = distgfs.run(distgfs_params, verbose=False)
+    params_dict = dict(params)
+    assert math.isclose(params_dict["x"], seed_x, rel_tol=1e-3)
+    assert math.isclose(val, 0.0, abs_tol=1e-5)
+
+
+def test_initial_evals_merge_with_checkpoint():
+    """initial_evals passed alongside a resumed checkpoint are merged with
+    the resumed evaluations and are persisted on the next save (bookkeeping
+    fix: seeded evals were never on disk, so they must not be excluded from
+    the first save_evals() call after construction)."""
+    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+        fpath = tmp.name
+    os.unlink(fpath)
+
+    space = {"x": [-4.5, 4.5]}
+    problem_parameters = {"y": 1.0}
+    n_iter_first = 5
+    n_iter_second = 4
+    n_seeded = 2
+
+    try:
+        distgfs_params_first = {
+            "opt_id": "distgfs_levi_merge",
+            "obj_fun_name": "obj_fun",
+            "obj_fun_module": "test_distgfs",
+            "problem_parameters": problem_parameters,
+            "space": space,
+            "n_iter": n_iter_first,
+            "n_max_tasks": 1,
+            "file_path": fpath,
+            "save": True,
+            "save_iter": n_iter_first,
+        }
+        distgfs.run(distgfs_params_first, verbose=False)
+
+        distgfs_params_second = {
+            "opt_id": "distgfs_levi_merge",
+            "obj_fun_name": "obj_fun",
+            "obj_fun_module": "test_distgfs",
+            "problem_parameters": problem_parameters,
+            "space": space,
+            "n_iter": n_iter_second,
+            "n_max_tasks": 1,
+            "file_path": fpath,
+            "save": True,
+            "save_iter": n_iter_second,
+            "initial_evals": {
+                0: [
+                    dlib.function_evaluation(x=[1.0 / 0.4], y=0.0),
+                    dlib.function_evaluation(x=[-2.0], y=-5.0),
+                ]
+            },
+        }
+        distgfs.run(distgfs_params_second, verbose=False)
+
+        with h5py.File(fpath, "r") as f:
+            grp = f["distgfs_levi_merge"]
+            n_objectives = len(grp["0"]["objectives"])
+            assert n_objectives == n_iter_first + n_seeded + n_iter_second
+    finally:
+        if os.path.exists(fpath):
+            os.unlink(fpath)
+
+
+def test_initial_evals_dimension_mismatch_raises():
+    """An initial_evals entry whose x dimensionality doesn't match the
+    configured space must raise ValueError, not silently misalign params.
+
+    Constructs DistGFSOptimizer directly rather than via distgfs.run():
+    distwq's controller loop catches ValueError from the controller function
+    and turns it into a graceful abort() rather than propagating it, so it
+    cannot be observed with pytest.raises() through the distgfs.run() path.
+    """
+    space = {"x": [-4.5, 4.5]}
+    problem_parameters = {"y": 1.0}
+
+    with pytest.raises(ValueError):
+        distgfs.DistGFSOptimizer(
+            opt_id="distgfs_levi_bad_dim",
+            obj_fun=obj_fun,
+            problem_parameters=problem_parameters,
+            space=space,
+            n_iter=3,
+            initial_evals={0: [dlib.function_evaluation(x=[1.0, 2.0], y=0.0)]},
+        )
+
+
+def test_initial_feature_evals_requires_feature_dtypes():
+    """initial_feature_evals without feature_dtypes configured must raise,
+    since there is nowhere valid to store the seeded feature vectors."""
+    space = {"x": [-4.5, 4.5]}
+    problem_parameters = {"y": 1.0}
+
+    with pytest.raises(ValueError):
+        distgfs.DistGFSOptimizer(
+            opt_id="distgfs_levi_bad_feat",
+            obj_fun=obj_fun,
+            problem_parameters=problem_parameters,
+            space=space,
+            n_iter=3,
+            initial_evals={0: [dlib.function_evaluation(x=[1.0 / 0.4], y=0.0)]},
+            initial_feature_evals={0: [(-1, [0.0])]},
+        )
+
+
+def test_initial_evals_unknown_problem_id_raises():
+    """initial_evals keyed by a problem_id outside the configured
+    problem_ids set must raise ValueError rather than silently creating an
+    orphaned, never-iterated entry."""
+    with pytest.raises(ValueError):
+        distgfs.DistGFSOptimizer(
+            opt_id="distgfs_levi_pp_bad_pid",
+            obj_fun=obj_fun_multi_int,
+            problem_parameters={"y": 1.0},
+            space={"x": [-4.5, 4.5]},
+            problem_ids={0, 1},
+            per_problem_tasks=True,
+            n_iter=3,
+            initial_evals={2: [dlib.function_evaluation(x=[1.0 / 0.4], y=0.0)]},
+        )

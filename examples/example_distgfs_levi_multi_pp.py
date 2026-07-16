@@ -21,6 +21,7 @@ def levi(x, y):
 def obj_fun(pp, pid):
     """Objective function to be _maximized_ by GFS."""
     results = {}
+    print(f"obj_fun: pp = {pp} pid = {pid}")
     for problem_id, params in pp.items():
         x, y = params["x"], params["y"]
         scale = 0.5 if problem_id == 0 else 0.4

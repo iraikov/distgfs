@@ -73,6 +73,10 @@ class DistGFSOptimizer:
         file_path: Optional[str] = None,
         save: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
+        initial_evals: Optional[Dict[ProblemId, List[dlib.function_evaluation]]] = None,
+        initial_feature_evals: Optional[
+            Dict[ProblemId, List[Tuple[int, ndarray]]]
+        ] = None,
         verbose: bool = False,
         **kwargs,
     ) -> None:
@@ -129,6 +133,20 @@ class DistGFSOptimizer:
         :param float seed: (optional) Sets the seed used for random
             sampling by the optimization algorithm. If None, the optimizer will always
             produce the same deterministic behavior.  Default: None
+        :param dict initial_evals: (optional) Per-problem_id list of
+            ``dlib.function_evaluation(x=..., y=...)`` objects for points
+            already evaluated by the caller before this optimizer was
+            constructed (dlib has no API to request evaluation of a
+            caller-specified x through the normal search loop, so seed points
+            must already carry their result). ``x`` must be ordered the same
+            as 'space' (or, if 'file_path' is also given and is resumed, the
+            same as the checkpoint's saved parameter order). Merged with, not
+            replacing, any evaluations resumed from 'file_path'.
+        :param dict initial_feature_evals: (optional) Per-problem_id list of
+            ``(placeholder_task_id, feature_ndarray)`` tuples giving the
+            feature vectors for the corresponding entries in 'initial_evals'
+            (index i in both lists must describe the same seed point). Only
+            valid together with 'feature_dtypes'.
         """
 
         self.opt_id = opt_id
@@ -182,18 +200,45 @@ class DistGFSOptimizer:
         if not has_problem_ids:
             problem_ids = set([0])
 
+        for label, seed_dict in (
+            ("initial_evals", initial_evals),
+            ("initial_feature_evals", initial_feature_evals),
+        ):
+            if seed_dict is None:
+                continue
+            unknown = set(seed_dict.keys()) - set(problem_ids)
+            if unknown:
+                raise ValueError(
+                    f"{label} contains problem_id(s) {unknown} not present "
+                    f"in problem_ids {problem_ids}"
+                )
+
+        n_resumed_evals = {pid: len(evals) for pid, evals in old_evals.items()}
+
+        if initial_evals:
+            for problem_id, evals in initial_evals.items():
+                for ev in evals:
+                    ev_x = list(ev.x)
+                    if len(ev_x) != len(param_names):
+                        raise ValueError(
+                            f"initial_evals for problem {problem_id}: eval x "
+                            f"has {len(ev_x)} dims, expected "
+                            f"{len(param_names)} ({param_names})"
+                        )
+                old_evals[problem_id] = old_evals.get(problem_id, []) + list(evals)
+
         n_saved_evals = {pid: 0 for pid in problem_ids}
         n_saved_features = {pid: 0 for pid in problem_ids}
         n_saved_constraints = {pid: 0 for pid in problem_ids}
         optimizer_dict = {}
         for problem_id in problem_ids:
-            if problem_id in old_evals:
+            if problem_id in old_evals and old_evals[problem_id]:
                 optimizer = dlib.global_function_search(
                     [spec],
                     initial_function_evals=[old_evals[problem_id]],
                     relative_noise_magnitude=noise_mag,
                 )
-                n_saved_evals[problem_id] = len(old_evals[problem_id])
+                n_saved_evals[problem_id] = n_resumed_evals.get(problem_id, 0)
             else:
                 optimizer = dlib.global_function_search([spec])
                 optimizer.set_relative_noise_magnitude(noise_mag)
@@ -245,6 +290,24 @@ class DistGFSOptimizer:
         self.feature_evals = None
         if self.feature_names is not None:
             self.feature_evals = {problem_id: [] for problem_id in problem_ids}
+            if initial_feature_evals:
+                for problem_id, feats in initial_feature_evals.items():
+                    n_seeded_evals = len(old_evals.get(problem_id, [])) - (
+                        n_resumed_evals.get(problem_id, 0)
+                    )
+                    if len(feats) != n_seeded_evals:
+                        raise ValueError(
+                            f"initial_feature_evals for problem {problem_id} "
+                            f"has {len(feats)} entries, expected "
+                            f"{n_seeded_evals} to match initial_evals"
+                        )
+                    self.feature_evals[problem_id] = (
+                        list(feats) + self.feature_evals[problem_id]
+                    )
+        elif initial_feature_evals:
+            raise ValueError(
+                "initial_feature_evals given but no feature_dtypes configured"
+            )
         self.constraint_evals = None
         if self.constraint_names is not None:
             self.constraint_evals = {problem_id: [] for problem_id in problem_ids}
