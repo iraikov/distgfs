@@ -7,7 +7,7 @@ Based on [gfsopt](https://github.com/tsoernes/gfsopt).
 
 Provides the following features:
 * Parallel optimization: Run distributed hyperparameter searches via [mpi4py](https://github.com/mpi4py/mpi4py).
-* Save and restore progress: Save/restore settings, parameters and optimization progress to/from HDF5 file.
+* Save and restore progress: Save/restore settings, parameters and optimization progress to/from HDF5 file. Parameters are stored in float64 by default; set `parameter_dtype: "float32"` for smaller files. A resumed checkpoint keeps the precision it was created with.
 * Average over multiple runs: Run a stochastic objective function using the same
 parameters multiple times and report the average to Dlib's Global Function
 Search. Useful in highly stochastic domains to avoid biasing the search towards
