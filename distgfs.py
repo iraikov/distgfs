@@ -27,12 +27,88 @@ except ImportError as e:
 
 gfsopt_dict = {}
 
+PARAMETER_DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
+
+
+def validate_parameter_dtype(value: Any) -> np.dtype:
+    """Convert a requested parameter storage precision to a NumPy dtype.
+
+    :param value: ``"float32"``, ``"float64"``, the matching NumPy type or
+        dtype, or None, which selects float64.
+    :return: ``np.dtype(np.float32)`` or ``np.dtype(np.float64)``.
+    :raises ValueError: if the value names any other type, including
+        non-native byte order.
+    """
+    allowed = "'float32' or 'float64' (or the matching NumPy dtypes)"
+    if value is None:
+        return np.dtype(np.float64)
+    try:
+        dt = np.dtype(value)
+    except TypeError as e:
+        raise ValueError(
+            f"parameter_dtype {value!r} is not a valid dtype; expected {allowed}"
+        ) from e
+    if dt not in PARAMETER_DTYPES or not dt.isnative:
+        raise ValueError(
+            f"parameter_dtype {value!r} is not supported; expected {allowed}"
+        )
+    return dt
+
+
+def compare_problem_parameters(
+    given: Dict[str, float],
+    stored: Dict[str, float],
+    param_names: List[str],
+    stored_dtype: np.dtype,
+) -> List[str]:
+    """Describe how the given fixed problem parameters differ from stored ones.
+
+    A value counts as equal when it matches the stored value after rounding
+    to the stored precision. Two NaN values are equal. Names in
+    'param_names' are ignored because the search sets them on every
+    evaluation.
+
+    :param given: Fixed parameters supplied by the caller.
+    :param stored: Fixed parameters read from the checkpoint.
+    :param param_names: Names of the parameters being optimized over.
+    :param stored_dtype: Precision of the stored values.
+    :return: One human-readable entry per difference; empty if none.
+    """
+    ignored = set(param_names)
+    given_names = set(given) - ignored
+    stored_names = set(stored) - ignored
+    differences = []
+    missing = sorted(stored_names - given_names)
+    if missing:
+        differences.append(f"not given: {missing}")
+    extra = sorted(given_names - stored_names)
+    if extra:
+        differences.append(f"not stored: {extra}")
+    for name in sorted(given_names & stored_names):
+        try:
+            rounded = np.asarray(given[name], dtype=stored_dtype)
+            same = bool(np.array_equal(rounded, stored[name], equal_nan=True))
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            differences.append(
+                f"{name}: given {given[name]!r}, stored {stored[name]!r}"
+            )
+    return differences
+
+
+def h5_has_opt_id(file_path: str, opt_id: str) -> bool:
+    """Return True if the HDF5 file at 'file_path' holds a group named 'opt_id'."""
+    with h5py.File(file_path, "r") as f:
+        return opt_id in f
+
 
 def validate_inputs(
     problem_parameters: Dict[str, float],
     space: Dict[str, List[float]],
     save: bool,
     file_path: Optional[str],
+    opt_id: Optional[str] = None,
 ) -> None:
     # Verify inputs
     if file_path is None:
@@ -50,6 +126,13 @@ def validate_inputs(
         if not os.path.isfile(file_path):
             if problem_parameters is None or space is None:
                 raise FileNotFoundError(file_path)
+        elif opt_id is not None and not h5_has_opt_id(file_path, opt_id):
+            if problem_parameters is None or space is None:
+                raise ValueError(
+                    f"File {file_path} has no optimization group '{opt_id}'; "
+                    "to start a new one, specify problem parameters "
+                    "`problem_parameters` and a hyperparameter space `space`."
+                )
 
 
 class DistGFSOptimizer:
@@ -77,6 +160,7 @@ class DistGFSOptimizer:
         initial_feature_evals: Optional[
             Dict[ProblemId, List[Tuple[int, ndarray]]]
         ] = None,
+        parameter_dtype: Union[str, np.dtype, type, None] = "float64",
         verbose: bool = False,
         **kwargs,
     ) -> None:
@@ -105,6 +189,9 @@ class DistGFSOptimizer:
             Can include hyperparameters being optimized over, but does not need to.
             If a hyperparameter is specified in both 'problem_parameters' and 'space',
             its value in 'problem_parameters' will be overridden.
+            When resuming from 'file_path', these values are used as given and
+            compared with the stored ones; a warning is issued if they differ.
+            If omitted on resume, the stored values are used.
         :param dict space: Hyperparameters to optimize over.
             Entries should be of the form:
             ``parameter: (Low_Bound, High_Bound)`` e.g:
@@ -147,6 +234,12 @@ class DistGFSOptimizer:
             feature vectors for the corresponding entries in 'initial_evals'
             (index i in both lists must describe the same seed point). Only
             valid together with 'feature_dtypes'.
+        :param str parameter_dtype: (optional) Precision used to store
+            evaluated parameters, search bounds and fixed problem parameters
+            in a new checkpoint: ``"float64"`` (default) or ``"float32"``.
+            The precision of a checkpoint is fixed when its 'opt_id' group is
+            created; a resumed checkpoint keeps its own precision, with a
+            warning if it differs from this value.
         """
 
         self.opt_id = opt_id
@@ -156,7 +249,8 @@ class DistGFSOptimizer:
         if self.verbose:
             self.logger.setLevel(logging.INFO)
 
-        validate_inputs(problem_parameters, space, save, file_path)
+        self.parameter_dtype = validate_parameter_dtype(parameter_dtype)
+        validate_inputs(problem_parameters, space, save, file_path, opt_id)
 
         eps = solver_epsilon
         noise_mag = relative_noise_magnitude
@@ -170,7 +264,11 @@ class DistGFSOptimizer:
                 lo_bounds.append(lo)
                 hi_bounds.append(hi)
         old_evals = {}
-        if (file_path is not None) and os.path.isfile(file_path):
+        if (
+            (file_path is not None)
+            and os.path.isfile(file_path)
+            and h5_has_opt_id(file_path, opt_id)
+        ):
             (
                 old_evals,
                 old_feature_evals,
@@ -183,9 +281,40 @@ class DistGFSOptimizer:
                 hi_bounds,
                 eps,
                 noise_mag,
-                problem_parameters,
+                stored_problem_parameters,
                 problem_ids,
+                file_parameter_dtype,
             ) = init_from_h5(file_path, param_names, opt_id, self.logger)
+            if file_parameter_dtype != self.parameter_dtype:
+                msg = (
+                    f"Checkpoint {file_path} stores parameters for opt_id "
+                    f"'{opt_id}' as {file_parameter_dtype}, not the requested "
+                    f"{self.parameter_dtype}. New evaluations will be stored as "
+                    f"{file_parameter_dtype}; use a new file_path or opt_id to "
+                    f"store them as {self.parameter_dtype}."
+                )
+                self.logger.warning(msg)
+                warnings.warn(msg, UserWarning, stacklevel=2)
+                self.parameter_dtype = file_parameter_dtype
+            if problem_parameters is None:
+                problem_parameters = stored_problem_parameters
+            else:
+                differences = compare_problem_parameters(
+                    problem_parameters,
+                    stored_problem_parameters,
+                    param_names,
+                    file_parameter_dtype,
+                )
+                if differences:
+                    msg = (
+                        f"problem_parameters for opt_id '{opt_id}' differ from "
+                        f"those stored in {file_path}: {'; '.join(differences)}. "
+                        "Using the given values; the stored values describe "
+                        "the earlier evaluations."
+                    )
+                    self.logger.warning(msg)
+                    warnings.warn(msg, UserWarning, stacklevel=2)
+        problem_parameters = dict(problem_parameters)
 
         self.feature_dtypes = feature_dtypes
         self.feature_names = (
@@ -377,6 +506,7 @@ class DistGFSOptimizer:
             self.metadata,
             self.file_path,
             self.logger,
+            parameter_dtype=self.parameter_dtype,
         )
 
         for problem_id in self.problem_ids:
@@ -496,7 +626,14 @@ def h5_init_types(
     problem_parameters: Dict[str, float],
     spec: function_spec,
     metadata: Optional[Dict[str, Any]] = None,
+    parameter_dtype: Union[str, np.dtype, type] = np.float64,
 ) -> None:
+    """Create the named types and settings datasets of group '/{opt_id}'.
+
+    'parameter_dtype' sets the precision of evaluated parameters, search
+    bounds and fixed problem parameters for the lifetime of the group.
+    """
+    parameter_dtype = validate_parameter_dtype(parameter_dtype)
     opt_grp = h5_get_group(f, opt_id)
 
     param_keys = set(param_names)
@@ -586,7 +723,9 @@ def h5_init_types(
     dt = h5py.enum_dtype(param_mapping, basetype=np.uint16)
     opt_grp["parameter_enum"] = dt
 
-    dt = np.dtype([("parameter", opt_grp["parameter_enum"]), ("value", np.float32)])
+    dt = np.dtype(
+        [("parameter", opt_grp["parameter_enum"]), ("value", parameter_dtype)]
+    )
     opt_grp["problem_parameters_type"] = dt
 
     dset = h5_get_dataset(
@@ -595,8 +734,10 @@ def h5_init_types(
         maxshape=(len(param_mapping),),
         dtype=opt_grp["problem_parameters_type"].dtype,
     )
-    dset.resize((len(param_mapping),))
-    a = np.zeros(len(param_mapping), dtype=opt_grp["problem_parameters_type"].dtype)
+    dset.resize((len(problem_parameters),))
+    a = np.zeros(
+        len(problem_parameters), dtype=opt_grp["problem_parameters_type"].dtype
+    )
     idx = 0
     for idx, (parm, val) in enumerate(problem_parameters.items()):
         a[idx]["parameter"] = param_mapping[parm]
@@ -607,15 +748,15 @@ def h5_init_types(
         [
             ("parameter", opt_grp["parameter_enum"]),
             ("is_integer", bool),
-            ("lower", np.float32),
-            ("upper", np.float32),
+            ("lower", parameter_dtype),
+            ("upper", parameter_dtype),
         ]
     )
     opt_grp["parameter_spec_type"] = dt
 
     is_integer = np.asarray(spec.is_integer_variable, dtype=bool)
-    upper = np.asarray(spec.upper, dtype=np.float32)
-    lower = np.asarray(spec.lower, dtype=np.float32)
+    upper = np.asarray(spec.upper, dtype=parameter_dtype)
+    lower = np.asarray(spec.lower, dtype=parameter_dtype)
 
     dset = h5_get_dataset(
         opt_grp,
@@ -634,8 +775,33 @@ def h5_init_types(
         a[idx]["upper"] = hi
     dset[:] = a
 
-    dt = np.dtype({"names": param_names, "formats": [np.float32] * len(param_names)})
+    dt = np.dtype(
+        {"names": param_names, "formats": [parameter_dtype] * len(param_names)}
+    )
     opt_grp["parameter_space_type"] = dt
+
+
+def h5_parameter_dtype(opt_grp: Group) -> np.dtype:
+    """Return the precision used for parameter values in group 'opt_grp'.
+
+    The precision is read from the fields of the committed type
+    ``parameter_space_type``, or from the ``lower`` bound field of
+    ``parameter_spec_type`` if the space type has no fields. The result is
+    in native byte order.
+
+    :raises ValueError: if the parameter fields do not share one type.
+    """
+    space_dt = opt_grp["parameter_space_type"].dtype
+    field_dts = [space_dt.fields[name][0] for name in space_dt.names or ()]
+    if not field_dts:
+        field_dts = [opt_grp["parameter_spec_type"].dtype.fields["lower"][0]]
+    found = {np.dtype(dt.type) for dt in field_dts}
+    if len(found) != 1:
+        raise ValueError(
+            f"Group {opt_grp.name} stores parameters with mixed types "
+            f"{sorted(str(dt) for dt in found)}"
+        )
+    return found.pop()
 
 
 def h5_load_raw(input_file, opt_id):
@@ -671,9 +837,13 @@ def h5_load_raw(input_file, opt_id):
     parameters_idx_dict = {parm: idx for parm, idx in parameter_enum_dict.items()}
     parameters_name_dict = {idx: parm for parm, idx in parameters_idx_dict.items()}
 
-    problem_parameters = {
-        parameters_name_dict[idx]: val for idx, val in opt_grp["problem_parameters"]
-    }
+    # The first row for each name holds its value. Some files end with
+    # zero-filled rows that repeat the name with index 0, so later rows must
+    # not overwrite earlier ones.
+    problem_parameters = {}
+    for idx, val in opt_grp["problem_parameters"]:
+        problem_parameters.setdefault(parameters_name_dict[idx], float(val))
+    parameter_dtype = h5_parameter_dtype(opt_grp)
     parameter_specs = [
         (parameters_name_dict[spec[0]], tuple(spec)[1:])
         for spec in iter(opt_grp["parameter_spec"])
@@ -734,6 +904,7 @@ def h5_load_raw(input_file, opt_id):
         "relative_noise_magnitude": relative_noise_magnitude,
         "problem_parameters": problem_parameters,
         "problem_ids": problem_ids,
+        "parameter_dtype": parameter_dtype,
     }
 
     return raw_spec, raw_results, info
@@ -850,6 +1021,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
     noise_mag = info["relative_noise_magnitude"]
     problem_parameters = info["problem_parameters"]
     problem_ids = info["problem_ids"] if "problem_ids" in info else None
+    parameter_dtype = info["parameter_dtype"]
 
     return (
         old_evals,
@@ -865,6 +1037,7 @@ def init_from_h5(file_path, param_names, opt_id, logger):
         noise_mag,
         problem_parameters,
         problem_ids,
+        parameter_dtype,
     )
 
 
@@ -887,9 +1060,13 @@ def save_to_h5(
     metadata: Optional[Dict[str, Any]],
     fpath: str,
     logger: logging.Logger,
+    parameter_dtype: Union[str, np.dtype, type] = np.float64,
 ) -> None:
     """
     Save progress and settings to an HDF5 file 'fpath'.
+
+    'parameter_dtype' sets the parameter precision only when the group
+    '/{opt_id}' is created; later calls append in the group's own precision.
     """
 
     f = h5py.File(fpath, "a")
@@ -902,6 +1079,7 @@ def save_to_h5(
             param_names,
             problem_parameters,
             spec,
+            parameter_dtype=parameter_dtype,
         )
         opt_grp = h5_get_group(f, opt_id)
         if metadata is not None:
@@ -987,6 +1165,7 @@ def eval_obj_fun_sp(
     """
 
     this_space_vals = space_vals[problem_id]
+    pp = dict(pp)
     for j, key in enumerate(space_params):
         pp[key] = int(this_space_vals[j]) if is_int[j] else this_space_vals[j]
 
