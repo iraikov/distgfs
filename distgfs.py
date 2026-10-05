@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import warnings
+from collections.abc import Mapping
 from functools import partial
 from typing import (
     Any,
@@ -146,6 +147,87 @@ def validate_inputs(
                 )
 
 
+def _group_result_dict(
+    task_id: int,
+    values: List[Any],
+    reduce_fun: Optional[Callable],
+    reduce_fun_args: Optional[Dict[str, Any]],
+) -> Any:
+    """Combine the per-process results of a worker group into one result.
+
+    Processes that returned None are left out, as distwq before 2.0 did.
+    If one result remains it is used as it is, unless reduce_fun is given,
+    in which case reduce_fun receives the list of remaining results.  More
+    than one remaining result requires reduce_fun.
+    """
+    if not values:
+        raise ValueError(f"task {task_id}: the worker group returned no results")
+    present = [value for value in values if value is not None]
+    if not present:
+        raise ValueError(
+            f"task {task_id}: every process of the worker group returned None "
+            f"({len(values)} results), so there is no result to use"
+        )
+    if reduce_fun is not None:
+        return reduce_fun(present, **(reduce_fun_args or {}))
+    if len(present) > 1:
+        raise ValueError(
+            f"task {task_id} returned {len(present)} sub-worker results but no "
+            "reduce_fun is specified. Provide reduce_fun to merge them."
+        )
+    return present[0]
+
+
+def _task_result_dict(
+    task_id: int,
+    res: Any,
+    reduce_fun: Optional[Callable] = None,
+    reduce_fun_args: Optional[Dict[str, Any]] = None,
+) -> Mapping:
+    """Return the {problem_id: value} mapping held in the result of a task.
+
+    The result arrives in one of these forms, depending on the distwq
+    version and on whether a single process or a worker group ran the task:
+
+    - distwq.TaskResult (distwq 2.0, one process): its value is used;
+    - distwq.CollectiveTaskResult (distwq 2.0, worker group): its values
+      are combined by _group_result_dict();
+    - a list (distwq before 2.0, worker group): combined in the same way;
+    - anything else (distwq before 2.0, one process): used as it is.
+
+    reduce_fun is applied only to the results of a worker group.  The
+    wrapper classes are looked up when the function is called, because
+    distwq releases before 2.0 do not define them.
+
+    :raises ValueError: if a worker group gives no usable result, or more
+        than one without reduce_fun.
+    :raises TypeError: if the result is not a mapping.
+    """
+    task_result = getattr(distwq, "TaskResult", None)
+    collective_result = getattr(distwq, "CollectiveTaskResult", None)
+    source = "the objective function"
+    if task_result is not None and isinstance(res, task_result):
+        rres = res.value
+    elif collective_result is not None and isinstance(res, collective_result):
+        rres = _group_result_dict(
+            task_id, list(res.values), reduce_fun, reduce_fun_args
+        )
+        if reduce_fun is not None:
+            source = "reduce_fun"
+    elif isinstance(res, list):
+        rres = _group_result_dict(task_id, res, reduce_fun, reduce_fun_args)
+        if reduce_fun is not None:
+            source = "reduce_fun"
+    else:
+        rres = res
+    if not isinstance(rres, Mapping):
+        raise TypeError(
+            f"task {task_id}: expected a dict of problem ids from {source}, "
+            f"got {type(rres).__name__}"
+        )
+    return rres
+
+
 class DistGFSOptimizer:
     def __init__(
         self,
@@ -209,9 +291,14 @@ class DistGFSOptimizer:
             ``{'alpha': (0.65, 0.85), 'gamma': (1, 8)}``. If both bounds for a
             parameter are Ints, then only integers within the (inclusive) range
             will be sampled and tested.
-        :param func reduce_fun: function to reduce multiple results per evaluation
-            obtained from each distributed worker. Must take as argument a list
-            of objective evaluations.
+        :param func reduce_fun: function to combine the results of one
+            evaluation computed by a worker group (``nprocs_per_worker`` > 1,
+            or any worker group under distwq 2.0). It receives the list of
+            the group's results, leaving out processes that returned None,
+            followed by the keyword arguments in 'reduce_fun_args', and must
+            return a single result of the form ``{problem_id: value}``. It is
+            not called for results from a single process. Without it, a
+            group must produce exactly one result that is not None.
         :param int n_iter: (optional) Number of times to sample and test params.
         :param int save_iter: (optional) How often to save progress.
         :param str file_path: (optional) File name for restoring
@@ -557,35 +644,19 @@ class DistGFSOptimizer:
     def update_result_value(
         self,
         task_id: int,
-        res: Dict[ProblemId, Tuple[float, ndarray]],
+        res: Any,
         expected_ids: Optional[Tuple[ProblemId, ...]] = None,
     ) -> None:
         """Pass the result of task 'task_id' to the optimizer of each problem.
 
+        :param res: The result as the distwq controller returned it: a
+            TaskResult or CollectiveTaskResult with distwq 2.0, a plain
+            value or a list with earlier releases.  See _task_result_dict().
         :param expected_ids: (optional) The problem ids the task was
             submitted for.  If given, the result must hold exactly these
             ids; otherwise ValueError is raised before any value is set.
         """
-        if isinstance(res, list):
-            # MPICollectiveBroker path: res is a list with one entry per
-            # contributing sub-worker rank.  reduce_fun, when provided, is
-            # responsible for merging the list into a single result dict
-            # (e.g. averaging across replicates).  Without reduce_fun the
-            # first element is used, which is correct for nprocs_per_worker=1.
-            if self.reduce_fun is not None:
-                rres = self.reduce_fun(res, **self.reduce_fun_args)
-            elif len(res) == 1:
-                rres = res[0]
-            else:
-                raise ValueError(
-                    f"update_result_value: task {task_id} returned "
-                    f"{len(res)} sub-worker results but no reduce_fun "
-                    "is specified. Provide reduce_fun to merge them."
-                )
-        else:
-            # Plain MPIWorker or no-MPI path: res is the raw result dict.
-            # reduce_fun is not called here - there is nothing to reduce.
-            rres = res
+        rres = _task_result_dict(task_id, res, self.reduce_fun, self.reduce_fun_args)
         if expected_ids is not None:
             missing = set(expected_ids) - set(rres)
             unexpected = set(rres) - set(expected_ids)
@@ -1233,54 +1304,69 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     return result_dict
 
 
+def _lookup(module_name: str, name: str) -> Any:
+    """Return the object called 'name' in module 'module_name', importing
+    the module first if needed."""
+    if module_name not in sys.modules:
+        importlib.import_module(module_name)
+    return eval(name, sys.modules[module_name].__dict__)
+
+
+def _init_controller_side(gfsopt_params: Dict[str, Any]) -> None:
+    """Do the setup that belongs to the controller.
+
+    Calls the controller init function, if one is named, and resolves a
+    named reduce_fun into gfsopt_params.
+    """
+    ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
+    if ctrl_init_fun_name is not None:
+        ctrl_init_fun = _lookup(
+            gfsopt_params.get("controller_init_fun_module", "__main__"),
+            ctrl_init_fun_name,
+        )
+        ctrl_init_fun(**gfsopt_params.get("controller_init_fun_args", {}))
+    reducefun_name = gfsopt_params.get("reduce_fun_name", None)
+    if reducefun_name is not None:
+        gfsopt_params["reduce_fun"] = _lookup(
+            gfsopt_params.get("reduce_fun_module", "__main__"), reducefun_name
+        )
+        gfsopt_params["reduce_fun_args"] = gfsopt_params.get("reduce_fun_args", {})
+
+
+def _init_worker_side(
+    gfsopt_params: Dict[str, Any], worker: Optional[Any] = None
+) -> Callable:
+    """Return the objective function, found by name or made by the named
+    init function, which receives 'worker'."""
+    objfun_name = gfsopt_params.get("obj_fun_name", None)
+    if objfun_name is not None:
+        return _lookup(gfsopt_params.get("obj_fun_module", "__main__"), objfun_name)
+    objfun_init_name = gfsopt_params.get("obj_fun_init_name", None)
+    if objfun_init_name is None:
+        raise RuntimeError("distgfs.gfsinit: objfun is not provided")
+    objfun_init = _lookup(
+        gfsopt_params.get("obj_fun_init_module", "__main__"), objfun_init_name
+    )
+    return objfun_init(**(gfsopt_params.get("obj_fun_init_args") or {}), worker=worker)
+
+
 def gfsinit(
     gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
     worker: Optional[int] = None,
     verbose: bool = False,
 ) -> DistGFSOptimizer:
-    objfun = None
-    objfun_module = gfsopt_params.get("obj_fun_module", "__main__")
-    objfun_name = gfsopt_params.get("obj_fun_name", None)
-    if distwq.is_worker:
-        if objfun_name is not None:
-            if objfun_module not in sys.modules:
-                importlib.import_module(objfun_module)
+    """Create the optimizer for this rank and register it in gfsopt_dict.
 
-            objfun = eval(objfun_name, sys.modules[objfun_module].__dict__)
-        else:
-            objfun_init_module = gfsopt_params.get("obj_fun_init_module", "__main__")
-            objfun_init_name = gfsopt_params.get("obj_fun_init_name", None)
-            objfun_init_args = gfsopt_params.get("obj_fun_init_args", None)
-            if objfun_init_name is None:
-                raise RuntimeError("distgfs.gfsinit: objfun is not provided")
-            if objfun_init_module not in sys.modules:
-                importlib.import_module(objfun_init_module)
-            objfun_init = eval(
-                objfun_init_name, sys.modules[objfun_init_module].__dict__
-            )
-            objfun = objfun_init(**objfun_init_args, worker=worker)
-    else:
-        ctrl_init_fun_module = gfsopt_params.get(
-            "controller_init_fun_module", "__main__"
-        )
-        ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
-        ctrl_init_fun_args = gfsopt_params.get("controller_init_fun_args", {})
-        if ctrl_init_fun_name is not None:
-            if ctrl_init_fun_module not in sys.modules:
-                importlib.import_module(ctrl_init_fun_module)
-            ctrl_init_fun = eval(
-                ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
-            )
-            ctrl_init_fun(**ctrl_init_fun_args)
-        reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
-        reducefun_name = gfsopt_params.get("reduce_fun_name", None)
-        reducefun_args = gfsopt_params.get("reduce_fun_args", {})
-        if reducefun_module not in sys.modules:
-            importlib.import_module(reducefun_module)
-        if reducefun_name is not None:
-            reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
-            gfsopt_params["reduce_fun"] = reducefun
-            gfsopt_params["reduce_fun_args"] = reducefun_args
+    The controller runs the controller init function and resolves
+    reduce_fun_name; a worker resolves the objective function.  A single
+    process is both controller and worker, so it does both, controller
+    part first.
+    """
+    if distwq.is_controller:
+        _init_controller_side(gfsopt_params)
+    objfun = None
+    if distwq.is_worker:
+        objfun = _init_worker_side(gfsopt_params, worker)
     gfsopt_params["obj_fun"] = objfun
     gfsopt = DistGFSOptimizer(**gfsopt_params, verbose=verbose)
     gfsopt_dict[gfsopt.opt_id] = gfsopt

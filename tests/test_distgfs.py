@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import os
 import shutil
@@ -5,6 +6,7 @@ import sys
 import tempfile
 import warnings
 
+import distwq
 import dlib
 import h5py
 import numpy as np
@@ -689,6 +691,9 @@ class FakeController:
     'release_on_submit', submit_call() releases results before dispatching,
     as distwq's submit_call() does through its own process() call.
 
+    'wrap', if given, is applied to every result before it is held, to
+    imitate the result types of a particular distwq version.
+
     A blocking process() with nothing held raises AssertionError, turning
     a hang into a test failure.
     """
@@ -700,8 +705,10 @@ class FakeController:
         release_on_submit=False,
         limit=None,
         extra_ids=(),
+        wrap=None,
     ):
         self.pattern = list(pattern)
+        self.wrap = wrap
         self.n_wakeups = 0
         self.reverse = reverse
         self.release_on_submit = release_on_submit
@@ -736,7 +743,10 @@ class FakeController:
         self.submitted.append((index, tuple(vals_dict)))
         task_id = self.count
         self.count += 1
-        self.held.append((task_id, fun(*args, **(kwargs or {}))))
+        result = fun(*args, **(kwargs or {}))
+        if self.wrap is not None:
+            result = self.wrap(result)
+        self.held.append((task_id, result))
         return task_id
 
     def process(self, limit=1000, block=False):
@@ -1037,3 +1047,369 @@ def test_update_result_value_checks_problem_ids(result, message):
 )
 def test_ordered_problem_ids(ids, expected):
     assert distgfs._ordered_problem_ids(ids) == expected
+
+
+# ---------------------------------------------------------------------------
+# Result forms: plain values and lists (distwq < 2.0), TaskResult and
+# CollectiveTaskResult (distwq 2.0)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class StandInTaskResult:
+    """Stand-in for distwq.TaskResult when the installed distwq lacks it."""
+
+    value: object
+
+
+@dataclasses.dataclass(frozen=True)
+class StandInCollectiveTaskResult:
+    """Stand-in for distwq.CollectiveTaskResult."""
+
+    values: list
+
+
+@pytest.fixture
+def result_types(monkeypatch):
+    """Return (TaskResult, CollectiveTaskResult): distwq's own classes when
+    it defines them, otherwise stand-ins installed on the distwq module."""
+    if hasattr(distwq, "TaskResult") and hasattr(distwq, "CollectiveTaskResult"):
+        return distwq.TaskResult, distwq.CollectiveTaskResult
+    monkeypatch.setattr(distwq, "TaskResult", StandInTaskResult, raising=False)
+    monkeypatch.setattr(
+        distwq, "CollectiveTaskResult", StandInCollectiveTaskResult, raising=False
+    )
+    return StandInTaskResult, StandInCollectiveTaskResult
+
+
+def must_not_reduce(values, **kwargs):
+    raise AssertionError("reduce_fun must not be called")
+
+
+def group_result(form, values, types):
+    """A worker group's result in the given form: 'list' or 'collective'."""
+    return list(values) if form == "list" else types[1](list(values))
+
+
+def test_result_plain_dict_used_as_is(result_types):
+    res = {0: -1.0}
+    assert distgfs._task_result_dict(1, res, must_not_reduce) is res
+
+
+def test_result_task_result_unwrapped(result_types):
+    task_result, _ = result_types
+    res = distgfs._task_result_dict(1, task_result({0: -1.0}), must_not_reduce)
+    assert res == {0: -1.0}
+
+
+@pytest.mark.parametrize("value", [None, [{0: -1.0}], -1.0])
+def test_result_task_result_not_a_dict_raises(result_types, value):
+    """A TaskResult holds one process's value; a list in it is not taken
+    for a group's results."""
+    task_result, _ = result_types
+    with pytest.raises(TypeError, match="objective function"):
+        distgfs._task_result_dict(1, task_result(value))
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+@pytest.mark.parametrize(
+    "values",
+    [[{0: -1.0}], [{0: -1.0}, None, None], [None, {0: -1.0}]],
+)
+def test_result_group_single_value(result_types, form, values):
+    """Without reduce_fun, the one result that is not None is used."""
+    res = distgfs._task_result_dict(1, group_result(form, values, result_types))
+    assert res == {0: -1.0}
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+def test_result_group_several_values_need_reduce_fun(result_types, form):
+    res = group_result(form, [{0: -1.0}, None, {0: -2.0}], result_types)
+    with pytest.raises(ValueError, match="2 sub-worker results.*reduce_fun"):
+        distgfs._task_result_dict(1, res)
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+@pytest.mark.parametrize(
+    "values, message",
+    [([None, None], "returned None"), ([], "no results")],
+)
+@pytest.mark.parametrize("reduce_fun", [None, must_not_reduce])
+def test_result_group_without_values_raises(
+    result_types, form, values, message, reduce_fun
+):
+    res = group_result(form, values, result_types)
+    with pytest.raises(ValueError, match=message):
+        distgfs._task_result_dict(1, res, reduce_fun)
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+def test_result_group_reduce_fun_receives_present_values(result_types, form):
+    """reduce_fun gets the results that are not None, in group order, and
+    the keyword arguments in reduce_fun_args."""
+    calls = []
+
+    def reduce_fun(values, **kwargs):
+        calls.append((values, kwargs))
+        return {0: sum(v[0] for v in values)}
+
+    first, second = {0: -1.0}, {0: -2.0}
+    res = group_result(form, [first, None, second], result_types)
+    out = distgfs._task_result_dict(1, res, reduce_fun, {"scale": 2})
+    assert out == {0: -3.0}
+    assert calls == [([first, second], {"scale": 2})]
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+def test_result_group_reduce_fun_on_single_value(result_types, form):
+    """reduce_fun is still called when only one result is present."""
+    res = group_result(form, [{0: -1.0}, None], result_types)
+    out = distgfs._task_result_dict(1, res, lambda values: {0: len(values)})
+    assert out == {0: 1}
+
+
+@pytest.mark.parametrize("form", ["list", "collective"])
+@pytest.mark.parametrize("returned", [None, [{0: -1.0}], -1.0])
+def test_result_reduce_fun_not_a_dict_raises(result_types, form, returned):
+    res = group_result(form, [{0: -1.0}, {0: -2.0}], result_types)
+    with pytest.raises(TypeError, match="reduce_fun"):
+        distgfs._task_result_dict(1, res, lambda values: returned)
+
+
+@pytest.mark.parametrize("res", [(({0: -1.0}),), None, -1.0, "abc"])
+def test_result_stray_types_raise(result_types, res):
+    with pytest.raises(TypeError, match="task 1"):
+        distgfs._task_result_dict(1, res)
+
+
+def test_result_plain_forms_without_wrapper_classes(monkeypatch):
+    """Releases of distwq before 2.0 define neither wrapper class."""
+    monkeypatch.delattr(distwq, "TaskResult", raising=False)
+    monkeypatch.delattr(distwq, "CollectiveTaskResult", raising=False)
+    assert distgfs._task_result_dict(1, {0: -1.0}) == {0: -1.0}
+    assert distgfs._task_result_dict(1, [{0: -1.0}, None]) == {0: -1.0}
+    with pytest.raises(TypeError):
+        distgfs._task_result_dict(1, None)
+
+
+def two_problem_optimizer(opt_id):
+    gfsopt = distgfs.DistGFSOptimizer(
+        opt_id=opt_id,
+        obj_fun=obj_fun_multi_int,
+        problem_parameters={"y": 1.0},
+        space={"x": [-4.5, 4.5]},
+        problem_ids={0, 1},
+    )
+    for problem_id in (0, 1):
+        gfsopt.evals[problem_id][7] = gfsopt.optimizer_dict[problem_id].get_next_x()
+    return gfsopt
+
+
+def test_update_result_value_collective(result_types):
+    _, collective_result = result_types
+    gfsopt = two_problem_optimizer("update_collective")
+    gfsopt.update_result_value(
+        7, collective_result([{0: -1.5, 1: -2.5}, None]), expected_ids=(0, 1)
+    )
+    for problem_id, y in ((0, -1.5), (1, -2.5)):
+        ys = gfsopt.optimizer_dict[problem_id].get_function_evaluations()[1][0]
+        assert [e.y for e in ys] == [y]
+
+
+def test_update_result_value_wrapped_missing_id(result_types):
+    """The problem-id check applies to the unwrapped result."""
+    task_result, _ = result_types
+    gfsopt = two_problem_optimizer("update_wrapped_missing")
+    with pytest.raises(ValueError, match="missing"):
+        gfsopt.update_result_value(7, task_result({0: -1.5}), expected_ids=(0, 1))
+
+
+WRAPS = {
+    "task_result": lambda types: types[0],
+    "collective_with_none": lambda types: lambda r: types[1]([r, None]),
+    "plain_list": lambda types: lambda r: [r],
+}
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("wrap", sorted(WRAPS))
+@pytest.mark.parametrize("per_problem", [False, True])
+def test_loop_wrapped_results(result_types, wrap, per_problem):
+    """The controller loop handles every result form in both modes."""
+    opt_id = f"loop_wrap_{wrap}_{per_problem}"
+    ctl = FakeController(pattern=(1,), reverse=True, wrap=WRAPS[wrap](result_types))
+    distgfs.gfsctrl(
+        ctl, multi_params(opt_id, 5, {0, 1}, per_problem=per_problem, n_max_tasks=2)
+    )
+    for problem_id in (0, 1):
+        assert n_evals(opt_id, problem_id) == 5
+
+
+@pytest.mark.timeout(60)
+def test_loop_wrapped_results_with_features(tmp_path, result_types):
+    """Features stay aligned with their parameters when results arrive in
+    reverse order as CollectiveTaskResults."""
+    _, collective_result = result_types
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController(reverse=True, wrap=lambda r: collective_result([None, r]))
+    distgfs.gfsctrl(
+        ctl,
+        loop_params(
+            "loop_wrap_feat",
+            n_iter=6,
+            n_max_tasks=3,
+            obj_fun_name="obj_fun_feature",
+            feature_dtypes=[("xcopy", np.float64)],
+            file_path=fpath,
+            save=True,
+            save_iter=6,
+        ),
+    )
+    with h5py.File(fpath, "r") as f:
+        grp = f["loop_wrap_feat"]["0"]
+        xs = grp["parameters"]["x"][:]
+        assert len(xs) == 6
+        assert np.array_equal(grp["features"]["xcopy"][:], xs)
+
+
+def mean_reduce(values, offset=0.0):
+    """Average the per-process results of a single-problem group."""
+    return {0: sum(v[0] for v in values) / len(values) + offset}
+
+
+@pytest.mark.timeout(60)
+def test_loop_reduce_fun_on_group_results(result_types):
+    """With reduce_fun, the optimizer records the reduced value of each
+    task's group results."""
+    _, collective_result = result_types
+    ctl = FakeController(wrap=lambda r: collective_result([r, {0: r[0] + 1.0}, None]))
+    distgfs.gfsctrl(
+        ctl,
+        loop_params(
+            "loop_reduce",
+            n_iter=6,
+            n_max_tasks=2,
+            reduce_fun=mean_reduce,
+            reduce_fun_args={"offset": 0.25},
+        ),
+    )
+    evals = distgfs.gfsopt_dict["loop_reduce"].optimizer_dict[0]
+    evals = evals.get_function_evaluations()[1][0]
+    assert len(evals) == 6
+    for e in evals:
+        assert math.isclose(e.y, -((e.x[0] - 0.3) ** 2) + 0.5 + 0.25)
+
+
+# ---------------------------------------------------------------------------
+# gfsinit: controller and worker setup
+# ---------------------------------------------------------------------------
+
+
+CONTROLLER_INIT_CALLS = []
+OBJ_FUN_INIT_CALLS = []
+
+
+def controller_init(**kwargs):
+    CONTROLLER_INIT_CALLS.append(kwargs)
+
+
+def obj_fun_init(worker=None, **kwargs):
+    """Objective factory that records how it was called."""
+    OBJ_FUN_INIT_CALLS.append((worker, kwargs))
+    return obj_fun_pids
+
+
+def init_params(opt_id, **extra):
+    params = loop_params(
+        opt_id,
+        n_iter=2,
+        controller_init_fun_name="controller_init",
+        controller_init_fun_module="test_distgfs",
+        controller_init_fun_args={"label": opt_id},
+        reduce_fun_name="mean_reduce",
+        reduce_fun_module="test_distgfs",
+        reduce_fun_args={"offset": 0.25},
+    )
+    params.update(extra)
+    return params
+
+
+@pytest.fixture
+def init_calls():
+    CONTROLLER_INIT_CALLS.clear()
+    OBJ_FUN_INIT_CALLS.clear()
+
+
+def set_roles(monkeypatch, is_controller, is_worker):
+    monkeypatch.setattr(distwq, "is_controller", is_controller)
+    monkeypatch.setattr(distwq, "is_worker", is_worker)
+
+
+def test_gfsinit_single_process_does_both(init_calls):
+    """A single process is controller and worker: it runs the controller
+    init, resolves reduce_fun_name, and resolves the objective."""
+    assert distwq.is_controller and distwq.is_worker
+    gfsopt = distgfs.gfsinit(init_params("init_single"))
+    assert CONTROLLER_INIT_CALLS == [{"label": "init_single"}]
+    assert gfsopt.reduce_fun is mean_reduce
+    assert gfsopt.reduce_fun_args == {"offset": 0.25}
+    assert gfsopt.eval_fun.args[0] is obj_fun_pids
+
+
+def test_gfsinit_controller_only(monkeypatch, init_calls):
+    """An MPI controller rank sets up the controller side only."""
+    set_roles(monkeypatch, is_controller=True, is_worker=False)
+    gfsopt = distgfs.gfsinit(init_params("init_controller"))
+    assert CONTROLLER_INIT_CALLS == [{"label": "init_controller"}]
+    assert gfsopt.reduce_fun is mean_reduce
+    assert gfsopt.eval_fun.args[0] is None
+
+
+def test_gfsinit_worker_only(monkeypatch, init_calls):
+    """An MPI worker rank resolves the objective only."""
+    set_roles(monkeypatch, is_controller=False, is_worker=True)
+    gfsopt = distgfs.gfsinit(init_params("init_worker"))
+    assert CONTROLLER_INIT_CALLS == []
+    assert gfsopt.reduce_fun is None
+    assert gfsopt.eval_fun.args[0] is obj_fun_pids
+
+
+def test_gfsinit_obj_fun_init(init_calls):
+    """The objective factory receives its arguments and the worker; its
+    arguments may be omitted."""
+    params = init_params(
+        "init_factory",
+        obj_fun_init_name="obj_fun_init",
+        obj_fun_init_module="test_distgfs",
+        obj_fun_init_args={"scale": 2},
+    )
+    del params["obj_fun_name"]
+    distgfs.gfsinit(params, worker="w")
+    assert OBJ_FUN_INIT_CALLS == [("w", {"scale": 2})]
+
+    del params["obj_fun_init_args"]
+    params["opt_id"] = "init_factory_noargs"
+    distgfs.gfsinit(params)
+    assert OBJ_FUN_INIT_CALLS[-1] == (None, {})
+
+
+def test_gfsinit_unknown_reduce_fun_name_raises(init_calls):
+    with pytest.raises(NameError, match="no_such_reduce"):
+        distgfs.gfsinit(
+            init_params("init_bad_reduce", reduce_fun_name="no_such_reduce")
+        )
+
+
+@pytest.mark.timeout(60)
+def test_loop_reduce_fun_name_single_process(result_types, init_calls):
+    """reduce_fun_name now takes effect without MPI: group results are
+    reduced by the named function."""
+    _, collective_result = result_types
+    ctl = FakeController(wrap=lambda r: collective_result([r, {0: r[0] + 1.0}]))
+    distgfs.gfsctrl(ctl, init_params("loop_reduce_name", n_iter=4))
+    evals = distgfs.gfsopt_dict["loop_reduce_name"].optimizer_dict[0]
+    evals = evals.get_function_evaluations()[1][0]
+    assert len(evals) == 4
+    for e in evals:
+        assert math.isclose(e.y, -((e.x[0] - 0.3) ** 2) + 0.5 + 0.25)
+    assert CONTROLLER_INIT_CALLS == [{"label": "loop_reduce_name"}]
