@@ -1,4 +1,14 @@
-# .github/workflows/build.yaml
+# .github/workflows/main.yaml
+#
+# Installs distgfs and its locked dependencies with uv, then runs the test
+# suite.  dlib has no binary wheels on PyPI and is compiled from source, which
+# takes several minutes; the uv cache keeps the built wheel between runs, keyed
+# on uv.lock.
+#
+# mpi4py needs an MPI library at run time, so MPICH is installed from apt.
+# The Open MPI launcher is installed as well: tests/test_distgfs_mpi.py uses
+# /usr/bin/mpirun.openmpi when the MPICH launcher cannot start a multi-process
+# world, and skips itself if no launcher works.
 name: distgfs CI
 
 on:
@@ -6,29 +16,33 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.10", "3.12"]
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
 
-      - name: Setup Python
-        uses: actions/setup-python@v2
+      - name: Install MPI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libmpich-dev mpich openmpi-bin
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
       - name: Install dependencies
-        run: |
-          sudo apt update -y && sudo apt upgrade 
-          sudo apt install build-essential mpich
-          python -m pip install --upgrade pip
-          python -m pip install tox tox-gh-actions
+        run: uv sync --locked --group test
 
-      - name: Run tox
-        run: tox
+      - name: Run tests
+        run: uv run --locked --group test pytest tests/ -v

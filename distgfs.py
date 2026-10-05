@@ -5,7 +5,18 @@ import os
 import sys
 import warnings
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 ProblemId = Union[int, str]
 
@@ -251,6 +262,10 @@ class DistGFSOptimizer:
 
         self.parameter_dtype = validate_parameter_dtype(parameter_dtype)
         validate_inputs(problem_parameters, space, save, file_path, opt_id)
+        if save and save_iter < 1:
+            raise ValueError(
+                f"save_iter must be at least 1 when saving, not {save_iter}"
+            )
 
         eps = solver_epsilon
         noise_mag = relative_noise_magnitude
@@ -328,6 +343,11 @@ class DistGFSOptimizer:
         has_problem_ids = problem_ids is not None
         if not has_problem_ids:
             problem_ids = set([0])
+        elif len(problem_ids) == 0:
+            raise ValueError(
+                "problem_ids must name at least one problem; "
+                "omit it to optimize a single problem"
+            )
 
         for label, seed_dict in (
             ("initial_evals", initial_evals),
@@ -535,8 +555,17 @@ class DistGFSOptimizer:
             self.logger.info(f"Best eval so far for: {res}@{prms}")
 
     def update_result_value(
-        self, task_id: int, res: Dict[ProblemId, Tuple[float, ndarray]]
+        self,
+        task_id: int,
+        res: Dict[ProblemId, Tuple[float, ndarray]],
+        expected_ids: Optional[Tuple[ProblemId, ...]] = None,
     ) -> None:
+        """Pass the result of task 'task_id' to the optimizer of each problem.
+
+        :param expected_ids: (optional) The problem ids the task was
+            submitted for.  If given, the result must hold exactly these
+            ids; otherwise ValueError is raised before any value is set.
+        """
         if isinstance(res, list):
             # MPICollectiveBroker path: res is a list with one entry per
             # contributing sub-worker rank.  reduce_fun, when provided, is
@@ -557,6 +586,20 @@ class DistGFSOptimizer:
             # Plain MPIWorker or no-MPI path: res is the raw result dict.
             # reduce_fun is not called here - there is nothing to reduce.
             rres = res
+        if expected_ids is not None:
+            missing = set(expected_ids) - set(rres)
+            unexpected = set(rres) - set(expected_ids)
+            if missing or unexpected:
+                problems = []
+                if missing:
+                    problems.append(f"missing ids {sorted(map(str, missing))}")
+                if unexpected:
+                    problems.append(f"unexpected ids {sorted(map(str, unexpected))}")
+                raise ValueError(
+                    f"update_result_value: task {task_id} was submitted for "
+                    f"problem ids {sorted(map(str, expected_ids))}, but its "
+                    f"result has {' and '.join(problems)}"
+                )
         for problem_id in rres:
             eval_req = self.evals[problem_id][task_id]
             parameters = list(eval_req.x)
@@ -1244,92 +1287,129 @@ def gfsinit(
     return gfsopt
 
 
-def _gfsctrl_all_problems(
-    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
-) -> None:
-    iter_count = 0
-    task_ids = []
-    n_tasks = 0
-    while iter_count < gfsopt.n_iter:
-        controller.process()
+def _ordered_problem_ids(problem_ids: Iterable[ProblemId]) -> List[ProblemId]:
+    """Return the distinct problem ids in a reproducible order.
 
-        if (iter_count > 0) and gfsopt.save and (iter_count % gfsopt.save_iter == 0):
-            gfsopt.save_evals()
+    Ids that can be compared with each other are sorted, so that the order
+    does not depend on how a set happens to iterate.  Ids that cannot be
+    compared, such as ints mixed with strings, keep their given order.
+    """
+    ids = list(dict.fromkeys(problem_ids))
+    try:
+        return sorted(ids)
+    except TypeError:
+        return ids
 
-        if len(task_ids) > 0:
-            rets = controller.probe_all_next_results()
-            for ret in rets:
-                task_id, res = ret
-                gfsopt.update_result_value(task_id, res)
-                task_ids.remove(task_id)
-                iter_count += 1
 
-        if (n_tasks < gfsopt.n_iter) and (len(task_ids) == 0):
-            while len(task_ids) < gfsopt.n_max_tasks:
-                vals_dict = {}
-                eval_req_dict = {}
-                for problem_id in gfsopt.problem_ids:
-                    eval_req = gfsopt.optimizer_dict[problem_id].get_next_x()
-                    eval_req_dict[problem_id] = eval_req
-                    vals = list(eval_req.x)
-                    vals_dict[problem_id] = vals
-                task_id = controller.submit_call(
-                    "eval_fun",
-                    module_name="distgfs",
-                    args=(
-                        gfsopt.opt_id,
-                        iter_count,
-                        vals_dict,
-                    ),
+def _next_unit(n_submitted: List[int], n_iter: int, start: int) -> Optional[int]:
+    """Return the first unit at or after 'start', wrapping around, that has
+    fewer than 'n_iter' submitted tasks, or None if every unit is full."""
+    n_units = len(n_submitted)
+    for offset in range(n_units):
+        unit = (start + offset) % n_units
+        if n_submitted[unit] < n_iter:
+            return unit
+    return None
+
+
+def _submit_task(
+    controller: distwq.MPIController,
+    gfsopt: "DistGFSOptimizer",
+    problem_ids: Tuple[ProblemId, ...],
+    index: int,
+) -> int:
+    """Submit one evaluation of the problems in 'problem_ids'.
+
+    A new point is requested from the optimizer of each problem, and the
+    request is recorded under the new task id so that update_result_value()
+    can pass the result back.  'index' reaches the objective function as
+    'pid'.  Returns the task id.
+    """
+    eval_reqs = {
+        problem_id: gfsopt.optimizer_dict[problem_id].get_next_x()
+        for problem_id in problem_ids
+    }
+    vals_dict = {problem_id: list(req.x) for problem_id, req in eval_reqs.items()}
+    task_id = controller.submit_call(
+        "eval_fun",
+        module_name="distgfs",
+        args=(gfsopt.opt_id, index, vals_dict),
+    )
+    for problem_id, req in eval_reqs.items():
+        gfsopt.evals[problem_id][task_id] = req
+    return task_id
+
+
+def _gfsctrl_loop(controller: distwq.MPIController, gfsopt: "DistGFSOptimizer") -> None:
+    """Submit evaluations and collect their results until the search is done.
+
+    The work is divided into units; a unit is the set of problem ids that
+    one task evaluates.  With per_problem_tasks every problem is a unit of
+    its own, and a new task is submitted as soon as a slot is free, taking
+    the units in turn.  Otherwise one unit holds every problem, and tasks
+    are submitted in batches: a new batch starts once every task of the
+    previous one has returned.
+
+    Each unit receives exactly n_iter tasks.  At most n_max_tasks tasks,
+    and at least one, are in flight at a time.  The task's submission
+    index within its unit is passed to the objective function as 'pid'.
+    With saving enabled, a checkpoint is written after every save_iter
+    results; gfsctrl() writes the last one.
+    """
+    problem_ids = _ordered_problem_ids(gfsopt.problem_ids)
+    rolling = gfsopt.per_problem_tasks
+    if rolling:
+        units = [(problem_id,) for problem_id in problem_ids]
+    else:
+        units = [tuple(problem_ids)]
+    n_iter = max(0, gfsopt.n_iter)
+    limit = max(1, gfsopt.n_max_tasks)
+    total = n_iter * len(units)
+
+    n_submitted = [0] * len(units)
+    in_flight: Dict[int, int] = {}  # task id -> unit index
+    next_unit = 0
+    n_done = 0
+    last_saved = 0
+
+    while n_done < total:
+        if rolling or not in_flight:
+            while len(in_flight) < limit:
+                unit = _next_unit(n_submitted, n_iter, next_unit)
+                if unit is None:
+                    break
+                task_id = _submit_task(
+                    controller, gfsopt, units[unit], n_submitted[unit]
                 )
-                task_ids.append(task_id)
-                n_tasks += 1
-                for problem_id in gfsopt.problem_ids:
-                    gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
-
-
-def _gfsctrl_per_problem(
-    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
-) -> None:
-    problem_ids = gfsopt.problem_ids
-    n_iter = gfsopt.n_iter
-    n_max_tasks = gfsopt.n_max_tasks
-
-    iter_counts = {pid: 0 for pid in problem_ids}
-    n_submitted = {pid: 0 for pid in problem_ids}
-    task_to_pid: Dict[int, ProblemId] = {}
-    in_flight: List[int] = []
-    pid_cycle = list(problem_ids)
-
-    while any(iter_counts[pid] < n_iter for pid in problem_ids):
-        controller.process()
-
-        total_done = sum(iter_counts.values())
-        if gfsopt.save and total_done > 0 and (total_done % gfsopt.save_iter == 0):
-            gfsopt.save_evals()
-
-        for task_id, res in controller.probe_all_next_results():
-            pid = task_to_pid.pop(task_id)
-            gfsopt.update_result_value(task_id, res)
-            in_flight.remove(task_id)
-            iter_counts[pid] += 1
-
-        for pid in pid_cycle:
-            if n_submitted[pid] >= n_iter:
-                continue
-            if len(in_flight) >= n_max_tasks:
-                break
-            eval_req = gfsopt.optimizer_dict[pid].get_next_x()
-            vals_dict = {pid: list(eval_req.x)}
-            task_id = controller.submit_call(
-                "eval_fun",
-                module_name="distgfs",
-                args=(gfsopt.opt_id, n_submitted[pid], vals_dict),
+                in_flight[task_id] = unit
+                n_submitted[unit] += 1
+                next_unit = (unit + 1) % len(units)
+        if not in_flight:
+            raise RuntimeError(
+                f"distgfs: no tasks in flight, but only {n_done} of {total} "
+                "results have been received"
             )
-            task_to_pid[task_id] = pid
-            in_flight.append(task_id)
-            gfsopt.evals[pid][task_id] = eval_req
-            n_submitted[pid] += 1
+
+        # Results can arrive while tasks are being submitted.  Collect them
+        # before waiting, because the wait returns only on a new message.
+        results = controller.probe_all_next_results()
+        if not results:
+            controller.process(block=True)
+            results = controller.probe_all_next_results()
+
+        for task_id, res in results:
+            unit = in_flight.pop(task_id, None)
+            if unit is None:
+                raise RuntimeError(
+                    f"distgfs: received a result for task {task_id}, "
+                    "which is not in flight"
+                )
+            gfsopt.update_result_value(task_id, res, expected_ids=units[unit])
+            n_done += 1
+
+        if gfsopt.save and n_done < total and n_done - last_saved >= gfsopt.save_iter:
+            gfsopt.save_evals()
+            last_saved = n_done
 
 
 def gfsctrl(
@@ -1342,20 +1422,16 @@ def gfsctrl(
     if verbose:
         logger.setLevel(logging.INFO)
 
-    n_max_tasks = gfsopt_params.get("n_max_tasks", None)
-    if (n_max_tasks is None) or (n_max_tasks < 1):
-        if gfsopt_params.get("per_problem_tasks", False):
-            _pids = gfsopt_params.get("problem_ids", set())
-            gfsopt_params["n_max_tasks"] = max(distwq.n_workers, len(_pids))
-        else:
-            gfsopt_params["n_max_tasks"] = distwq.n_workers
-
     gfsopt = gfsinit(gfsopt_params)
+    # The default is computed from the optimizer, whose problem ids may
+    # come from a resumed checkpoint rather than from gfsopt_params.
+    if (gfsopt.n_max_tasks is None) or (gfsopt.n_max_tasks < 1):
+        if gfsopt.per_problem_tasks:
+            gfsopt.n_max_tasks = max(distwq.n_workers, len(gfsopt.problem_ids))
+        else:
+            gfsopt.n_max_tasks = distwq.n_workers
     logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
-    if gfsopt.per_problem_tasks:
-        _gfsctrl_per_problem(controller, gfsopt)
-    else:
-        _gfsctrl_all_problems(controller, gfsopt)
+    _gfsctrl_loop(controller, gfsopt)
     if gfsopt.save:
         gfsopt.save_evals()
     controller.info()

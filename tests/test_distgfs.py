@@ -1,6 +1,7 @@
 import math
 import os
 import shutil
+import sys
 import tempfile
 import warnings
 
@@ -670,3 +671,369 @@ def test_h5_parameter_dtype_mixed_fields_raises(tmp_path):
         grp["parameter_space_type"] = np.dtype([("x", np.float32), ("z", np.float64)])
         with pytest.raises(ValueError, match="mixed types"):
             distgfs.h5_parameter_dtype(grp)
+
+
+# ---------------------------------------------------------------------------
+# Controller loop
+# ---------------------------------------------------------------------------
+
+
+class FakeController:
+    """Stand-in for distwq.MPIController that mimics MPI timing in one process.
+
+    Each task runs as soon as it is submitted, but its result is held back,
+    as if a worker were still computing it.  Every call to process() releases
+    held results according to 'pattern', a cycle of counts ("all" releases
+    everything; 0 is a wakeup that brings no result, like a READY message).
+    'reverse' releases the newest held results first.  With
+    'release_on_submit', submit_call() releases results before dispatching,
+    as distwq's submit_call() does through its own process() call.
+
+    A blocking process() with nothing held raises AssertionError, turning
+    a hang into a test failure.
+    """
+
+    def __init__(
+        self,
+        pattern=("all",),
+        reverse=False,
+        release_on_submit=False,
+        limit=None,
+        extra_ids=(),
+    ):
+        self.pattern = list(pattern)
+        self.n_wakeups = 0
+        self.reverse = reverse
+        self.release_on_submit = release_on_submit
+        self.limit = limit
+        self.extra_ids = list(extra_ids)
+        self.held = []
+        self.ready = []
+        self.count = 0
+        self.inflight_at_submit = []
+        self.submitted = []
+        self.blocked_with_ready = 0
+
+    def _outstanding(self):
+        return len(self.held) + len(self.ready)
+
+    def _release(self):
+        n = self.pattern[self.n_wakeups % len(self.pattern)]
+        self.n_wakeups += 1
+        n = len(self.held) if n == "all" else min(n, len(self.held))
+        for _ in range(n):
+            self.ready.append(self.held.pop() if self.reverse else self.held.pop(0))
+
+    def submit_call(self, name_to_call, args=(), kwargs=None, module_name="__main__"):
+        if self.release_on_submit:
+            self._release()
+        outstanding = self._outstanding()
+        if self.limit is not None:
+            assert outstanding < self.limit, "in-flight limit exceeded"
+        self.inflight_at_submit.append(outstanding)
+        fun = getattr(sys.modules[module_name], name_to_call)
+        _opt_id, index, vals_dict = args
+        self.submitted.append((index, tuple(vals_dict)))
+        task_id = self.count
+        self.count += 1
+        self.held.append((task_id, fun(*args, **(kwargs or {}))))
+        return task_id
+
+    def process(self, limit=1000, block=False):
+        if block:
+            assert self.held or self.ready, "blocking with nothing outstanding"
+            if self.ready:
+                self.blocked_with_ready += 1
+        self._release()
+
+    def probe_all_next_results(self):
+        ret = [(task_id, {}) for task_id in self.extra_ids] + self.ready
+        self.extra_ids = []
+        self.ready = []
+        return ret
+
+    def info(self):
+        pass
+
+
+RECORDED_CALLS = []
+
+
+def obj_fun_pids(pp, pid):
+    """Single-problem objective that records the 'pid' it receives."""
+    RECORDED_CALLS.append((pid, None))
+    return -((pp["x"] - 0.3) ** 2)
+
+
+def obj_fun_multi_pids(pp, pid):
+    """Multi-problem objective that records 'pid' and the problem ids."""
+    RECORDED_CALLS.append((pid, tuple(pp)))
+    return {
+        problem_id: -((params["x"] - 0.3) ** 2) for problem_id, params in pp.items()
+    }
+
+
+def obj_fun_feature(pp, pid):
+    """Objective whose feature is a copy of x, to check row alignment."""
+    feature = np.array([(pp["x"],)], dtype=np.dtype([("xcopy", np.float64)]))
+    return -((pp["x"] - 0.3) ** 2), feature
+
+
+def loop_params(opt_id, n_iter, n_max_tasks=1, **extra):
+    params = {
+        "opt_id": opt_id,
+        "obj_fun_name": "obj_fun_pids",
+        "obj_fun_module": "test_distgfs",
+        "problem_parameters": {"y": 0.1},
+        "space": {"x": [0.1, 0.7]},
+        "n_iter": n_iter,
+        "n_max_tasks": n_max_tasks,
+    }
+    params.update(extra)
+    return params
+
+
+def multi_params(opt_id, n_iter, problem_ids, per_problem, n_max_tasks=1, **extra):
+    return loop_params(
+        opt_id,
+        n_iter,
+        n_max_tasks,
+        obj_fun_name="obj_fun_multi_pids",
+        problem_ids=problem_ids,
+        per_problem_tasks=per_problem,
+        **extra,
+    )
+
+
+def n_evals(opt_id, problem_id=0):
+    optimizer = distgfs.gfsopt_dict[opt_id].optimizer_dict[problem_id]
+    return len(optimizer.get_function_evaluations()[1][0])
+
+
+@pytest.mark.timeout(60)
+def test_loop_batch_exact_count():
+    """Batch mode submits exactly n_iter tasks, and only when none are in
+    flight, even when n_max_tasks does not divide n_iter."""
+    ctl = FakeController(limit=2)
+    distgfs.gfsctrl(ctl, loop_params("loop_batch", n_iter=5, n_max_tasks=2))
+    assert ctl.inflight_at_submit == [0, 1, 0, 1, 0]
+    assert n_evals("loop_batch") == 5
+    assert ctl._outstanding() == 0
+
+
+@pytest.mark.timeout(60)
+def test_loop_batch_limit_larger_than_total():
+    ctl = FakeController()
+    distgfs.gfsctrl(ctl, loop_params("loop_batch_big", n_iter=5, n_max_tasks=10))
+    assert ctl.inflight_at_submit == [0, 1, 2, 3, 4]
+    assert n_evals("loop_batch_big") == 5
+
+
+@pytest.mark.timeout(60)
+def test_loop_unique_pids_all_problems():
+    """Every task of a batch gets its own pid, 0 .. n_iter-1."""
+    RECORDED_CALLS.clear()
+    distgfs.run(loop_params("loop_pids", n_iter=7, n_max_tasks=3))
+    assert sorted(pid for pid, _ in RECORDED_CALLS) == list(range(7))
+
+
+@pytest.mark.timeout(60)
+def test_loop_unique_pids_per_problem():
+    RECORDED_CALLS.clear()
+    distgfs.run(
+        multi_params("loop_pids_pp", 4, {0, 1}, per_problem=True, n_max_tasks=3)
+    )
+    for problem_id in (0, 1):
+        pids = sorted(pid for pid, ids in RECORDED_CALLS if ids == (problem_id,))
+        assert pids == list(range(4))
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("pattern", [("all",), (0, 0, 1)])
+def test_loop_save_count(tmp_path, monkeypatch, pattern):
+    """Checkpoints are written once per save_iter new results plus once at
+    the end, however many times the controller wakes up without a result."""
+    calls = []
+    original = distgfs.DistGFSOptimizer.save_evals
+
+    def counting_save(self):
+        calls.append(1)
+        original(self)
+
+    monkeypatch.setattr(distgfs.DistGFSOptimizer, "save_evals", counting_save)
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController(pattern=pattern)
+    distgfs.gfsctrl(
+        ctl,
+        loop_params("loop_save", n_iter=20, file_path=fpath, save=True, save_iter=5),
+    )
+    assert len(calls) == 4
+    with h5py.File(fpath, "r") as f:
+        assert len(f["loop_save"]["0"]["objectives"]) == 20
+
+
+@pytest.mark.timeout(60)
+def test_loop_results_during_submit():
+    """Results that arrive while a task is being submitted are collected
+    before the controller blocks again, and the work still completes."""
+    ctl = FakeController(pattern=(1,), release_on_submit=True, limit=2)
+    distgfs.gfsctrl(
+        ctl, multi_params("loop_submit", 6, {0, 1, 2}, per_problem=True, n_max_tasks=2)
+    )
+    assert ctl.blocked_with_ready == 0
+    for problem_id in (0, 1, 2):
+        assert n_evals("loop_submit", problem_id) == 6
+
+
+@pytest.mark.timeout(60)
+def test_loop_rolling_fairness_out_of_order():
+    """Rolling mode refills free slots while other tasks are running, keeps
+    within n_max_tasks, and gives every problem exactly n_iter tasks."""
+    ctl = FakeController(pattern=(1,), reverse=True, limit=2)
+    distgfs.gfsctrl(
+        ctl, multi_params("loop_fair", 4, {0, 1, 2}, per_problem=True, n_max_tasks=2)
+    )
+    assert max(ctl.inflight_at_submit) == 1
+    assert any(n > 0 for n in ctl.inflight_at_submit)
+    for problem_id in (0, 1, 2):
+        assert sum(1 for _, ids in ctl.submitted if ids == (problem_id,)) == 4
+        assert n_evals("loop_fair", problem_id) == 4
+
+
+@pytest.mark.timeout(60)
+def test_loop_round_robin_order():
+    """With one slot, problems take turns instead of one problem running
+    all of its tasks first."""
+    ctl = FakeController()
+    distgfs.gfsctrl(
+        ctl, multi_params("loop_rr", 3, {2, 0, 1}, per_problem=True, n_max_tasks=1)
+    )
+    assert [ids for _, ids in ctl.submitted] == [(0,), (1,), (2,)] * 3
+
+
+@pytest.mark.timeout(60)
+def test_loop_out_of_order_features(tmp_path):
+    """Features stay aligned with their parameters when results arrive in
+    reverse order."""
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController(reverse=True)
+    distgfs.gfsctrl(
+        ctl,
+        loop_params(
+            "loop_feat",
+            n_iter=6,
+            n_max_tasks=3,
+            obj_fun_name="obj_fun_feature",
+            feature_dtypes=[("xcopy", np.float64)],
+            file_path=fpath,
+            save=True,
+            save_iter=6,
+        ),
+    )
+    with h5py.File(fpath, "r") as f:
+        grp = f["loop_feat"]["0"]
+        xs = grp["parameters"]["x"][:]
+        assert len(xs) == 6
+        assert np.array_equal(grp["features"]["xcopy"][:], xs)
+
+
+@pytest.mark.timeout(60)
+def test_loop_zero_iterations_saves_seeds(tmp_path):
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController()
+    distgfs.gfsctrl(
+        ctl,
+        loop_params(
+            "loop_zero",
+            n_iter=0,
+            file_path=fpath,
+            save=True,
+            initial_evals={0: [dlib.function_evaluation(x=[0.3], y=0.0)]},
+        ),
+    )
+    assert ctl.submitted == []
+    with h5py.File(fpath, "r") as f:
+        assert len(f["loop_zero"]["0"]["objectives"]) == 1
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("per_problem", [False, True])
+def test_loop_default_n_max_tasks_terminates(per_problem):
+    """Without MPI there are no workers; leaving n_max_tasks unset must
+    still run the optimization."""
+    params = multi_params("loop_default", 3, {0, 1}, per_problem=per_problem)
+    del params["n_max_tasks"]
+    best = distgfs.run(params)
+    assert set(best) == {0, 1}
+    for problem_id in (0, 1):
+        assert n_evals("loop_default", problem_id) == 3
+
+
+@pytest.mark.timeout(60)
+def test_loop_unknown_task_id_raises():
+    ctl = FakeController(extra_ids=[999])
+    with pytest.raises(RuntimeError, match="999"):
+        distgfs.gfsctrl(ctl, loop_params("loop_unknown", n_iter=3))
+
+
+def test_save_iter_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="save_iter"):
+        distgfs.DistGFSOptimizer(
+            opt_id="bad_save_iter",
+            obj_fun=obj_fun_record,
+            problem_parameters={"y": 0.1},
+            space={"x": [0.1, 0.7]},
+            file_path=str(tmp_path / "ckpt.h5"),
+            save=True,
+            save_iter=0,
+        )
+    distgfs.DistGFSOptimizer(
+        opt_id="unsaved_save_iter",
+        obj_fun=obj_fun_record,
+        problem_parameters={"y": 0.1},
+        space={"x": [0.1, 0.7]},
+        save_iter=0,
+    )
+
+
+def test_empty_problem_ids_raises():
+    with pytest.raises(ValueError, match="problem_ids"):
+        distgfs.DistGFSOptimizer(
+            opt_id="empty_pids",
+            obj_fun=obj_fun_multi_int,
+            problem_parameters={"y": 1.0},
+            space={"x": [-4.5, 4.5]},
+            problem_ids=set(),
+        )
+
+
+@pytest.mark.parametrize(
+    "result, message",
+    [({0: -1.0}, "missing"), ({0: -1.0, 1: -1.0, 2: -1.0}, "unexpected")],
+)
+def test_update_result_value_checks_problem_ids(result, message):
+    gfsopt = distgfs.DistGFSOptimizer(
+        opt_id="check_pids",
+        obj_fun=obj_fun_multi_int,
+        problem_parameters={"y": 1.0},
+        space={"x": [-4.5, 4.5]},
+        problem_ids={0, 1},
+    )
+    for problem_id in (0, 1):
+        gfsopt.evals[problem_id][7] = gfsopt.optimizer_dict[problem_id].get_next_x()
+    with pytest.raises(ValueError, match=message):
+        gfsopt.update_result_value(7, result, expected_ids=(0, 1))
+
+
+@pytest.mark.parametrize(
+    "ids, expected",
+    [
+        ({3, 1, 2}, [1, 2, 3]),
+        ({"b", "a"}, ["a", "b"]),
+        ([2, "a", 1], [2, "a", 1]),
+        ([1, 0, 1, 0], [0, 1]),
+        (["a", 1, "a"], ["a", 1]),
+    ],
+)
+def test_ordered_problem_ids(ids, expected):
+    assert distgfs._ordered_problem_ids(ids) == expected
