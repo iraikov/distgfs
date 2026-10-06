@@ -29,8 +29,7 @@ if __name__ == "__main__":
     distgfs.run(
         {
             "opt_id": "mpi_loop",
-            "obj_fun_name": "obj_fun",
-            "obj_fun_module": "mpi_distgfs_driver",
+            "obj_fun_name": "mpi_distgfs_driver.obj_fun",
             "problem_parameters": {"y": 0.1},
             "space": {"x": [0.1, 0.7]},
             "problem_ids": PROBLEM_IDS,

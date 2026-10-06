@@ -56,8 +56,7 @@ problem_parameters = {'y': 1.}
 
 # Create an optimizer parameter set
 distgfs_params = {'opt_id': 'distgfs_levi',
-                  'obj_fun_name': 'obj_fun',
-                  'obj_fun_module': 'example_distgfs_levi_file',
+                  'obj_fun_name': 'example_distgfs_levi_file.obj_fun',
                   'problem_parameters': problem_parameters,
                   'space': space,
                   'n_iter': 10,

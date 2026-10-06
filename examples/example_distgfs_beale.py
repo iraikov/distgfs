@@ -36,8 +36,7 @@ if __name__ == "__main__":
     # Create an optimizer
     distgfs_params = {
         "opt_id": "distgfs_beale",
-        "obj_fun_name": "obj_fun",
-        "obj_fun_module": "example_distgfs_beale",
+        "obj_fun_name": "example_distgfs_beale.obj_fun",
         "problem_parameters": problem_parameters,
         "space": space,
         "seed": 42,

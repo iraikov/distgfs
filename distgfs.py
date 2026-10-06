@@ -1304,12 +1304,99 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     return result_dict
 
 
-def _lookup(module_name: str, name: str) -> Any:
-    """Return the object called 'name' in module 'module_name', importing
-    the module first if needed."""
-    if module_name not in sys.modules:
-        importlib.import_module(module_name)
-    return eval(name, sys.modules[module_name].__dict__)
+# gfsopt_params keys that gave the module of a *_fun_name before the names
+# became paths, and the name key that now carries the module.
+REMOVED_MODULE_KEYS = {
+    "obj_fun_module": "obj_fun_name",
+    "obj_fun_init_module": "obj_fun_init_name",
+    "controller_init_fun_module": "controller_init_fun_name",
+    "reduce_fun_module": "reduce_fun_name",
+    "broker_module_name": "broker_fun_name",
+}
+
+
+def check_removed_module_keys(gfsopt_params: Dict[str, Any]) -> None:
+    """Raise TypeError if gfsopt_params uses a removed *_module key.
+
+    Functions are now named by a single path such as "mymodule.obj_fun",
+    so a separate module key would be ignored.  TypeError, rather than
+    ValueError, is used because distwq releases before 2.0 turn a
+    ValueError raised on the controller into a silent abort.
+    """
+    found = sorted(key for key in REMOVED_MODULE_KEYS if key in gfsopt_params)
+    if found:
+        hints = ", ".join(
+            f"{key} -> {REMOVED_MODULE_KEYS[key]}='{gfsopt_params[key]}.<name>'"
+            for key in found
+        )
+        raise TypeError(
+            f"distgfs: gfsopt_params keys {found} are no longer supported; give "
+            f"the module as part of the function name instead ({hints})"
+        )
+
+
+def resolve_object_path(path: str) -> Any:
+    """Return the object named by 'path'.
+
+    A path has the form "module.name", for example "mymodule.obj_fun" or
+    "mypackage.sub.obj_fun".  The longest leading part of the path that
+    names an importable module is taken as the module, and the rest is
+    looked up in it as a chain of attributes, so that "mymodule.Model.run"
+    also works.  A path with no importable module part, such as
+    "obj_fun", names an object in __main__.
+
+    :raises TypeError: if 'path' is not a string.
+    :raises ImportError: if 'path' is malformed or names nothing.
+    """
+    if not isinstance(path, str):
+        raise TypeError(f"distgfs: expected a path string, got {path!r}")
+    parts = path.split(".")
+    if not all(part.isidentifier() for part in parts):
+        raise ImportError(f"distgfs: '{path}' is not a valid module.name path")
+    for i in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:i])
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as e:
+            # Try a shorter prefix only if this module itself is missing,
+            # not if it exists but fails to import one of its dependencies.
+            if e.name is not None and (
+                module_name == e.name or module_name.startswith(e.name + ".")
+            ):
+                continue
+            raise
+        return _attribute_path(module, parts[i:], path)
+    return _attribute_path(sys.modules["__main__"], parts, path, in_main=True)
+
+
+def _attribute_path(
+    module: Any, names: List[str], path: str, in_main: bool = False
+) -> Any:
+    """Follow the attributes 'names' from 'module'.
+
+    'path' and 'in_main' (True when no module part of the path could be
+    imported) only shape the error message.
+    """
+    obj = module
+    for name in names:
+        try:
+            obj = getattr(obj, name)
+        except AttributeError as e:
+            where = f"module '{module.__name__}' has no attribute '{'.'.join(names)}'"
+            if in_main and len(names) > 1:
+                where = f"no module '{names[0]}' could be imported, and {where}"
+            raise ImportError(f"distgfs: cannot find '{path}': {where}") from e
+    return obj
+
+
+def resolve_callable(path: str, key: str) -> Callable:
+    """Return the function named by 'path', given as gfsopt_params[key]."""
+    obj = resolve_object_path(path)
+    if not callable(obj):
+        raise TypeError(
+            f"distgfs: {key} '{path}' names a {type(obj).__name__}, not a function"
+        )
+    return obj
 
 
 def _init_controller_side(gfsopt_params: Dict[str, Any]) -> None:
@@ -1320,15 +1407,12 @@ def _init_controller_side(gfsopt_params: Dict[str, Any]) -> None:
     """
     ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
     if ctrl_init_fun_name is not None:
-        ctrl_init_fun = _lookup(
-            gfsopt_params.get("controller_init_fun_module", "__main__"),
-            ctrl_init_fun_name,
-        )
+        ctrl_init_fun = resolve_callable(ctrl_init_fun_name, "controller_init_fun_name")
         ctrl_init_fun(**gfsopt_params.get("controller_init_fun_args", {}))
     reducefun_name = gfsopt_params.get("reduce_fun_name", None)
     if reducefun_name is not None:
-        gfsopt_params["reduce_fun"] = _lookup(
-            gfsopt_params.get("reduce_fun_module", "__main__"), reducefun_name
+        gfsopt_params["reduce_fun"] = resolve_callable(
+            reducefun_name, "reduce_fun_name"
         )
         gfsopt_params["reduce_fun_args"] = gfsopt_params.get("reduce_fun_args", {})
 
@@ -1340,13 +1424,11 @@ def _init_worker_side(
     init function, which receives 'worker'."""
     objfun_name = gfsopt_params.get("obj_fun_name", None)
     if objfun_name is not None:
-        return _lookup(gfsopt_params.get("obj_fun_module", "__main__"), objfun_name)
+        return resolve_callable(objfun_name, "obj_fun_name")
     objfun_init_name = gfsopt_params.get("obj_fun_init_name", None)
     if objfun_init_name is None:
         raise RuntimeError("distgfs.gfsinit: objfun is not provided")
-    objfun_init = _lookup(
-        gfsopt_params.get("obj_fun_init_module", "__main__"), objfun_init_name
-    )
+    objfun_init = resolve_callable(objfun_init_name, "obj_fun_init_name")
     return objfun_init(**(gfsopt_params.get("obj_fun_init_args") or {}), worker=worker)
 
 
@@ -1362,6 +1444,7 @@ def gfsinit(
     process is both controller and worker, so it does both, controller
     part first.
     """
+    check_removed_module_keys(gfsopt_params)
     if distwq.is_controller:
         _init_controller_side(gfsopt_params)
     objfun = None
@@ -1546,6 +1629,19 @@ def gfswork(
     gfsinit(gfsopt_params, worker=worker, verbose=verbose)
 
 
+def gfsbroker(broker: Any, gfsopt_params: Dict[str, Any], verbose: bool = False) -> Any:
+    """Broker function that distgfs gives to distwq.run().
+
+    distwq.run() looks its broker function up in the module of the worker
+    function, which for distgfs is distgfs itself, so a user's broker
+    function cannot be named to it directly.  When gfsopt_params names one
+    in 'broker_fun_name', distgfs passes this function instead; it calls
+    the named function with the arguments distwq gives a broker function.
+    """
+    broker_fun = resolve_callable(gfsopt_params["broker_fun_name"], "broker_fun_name")
+    return broker_fun(broker, gfsopt_params, verbose)
+
+
 def eval_fun(opt_id: str, *args) -> Dict[ProblemId, float]:
     return gfsopt_dict[opt_id].eval_fun(*args)
 
@@ -1562,6 +1658,7 @@ def run(
     spawn_args: List[Any] = [],
     verbose: bool = False,
 ) -> Tuple[List[Tuple[str, float]], float]:
+    check_removed_module_keys(gfsopt_params)
     if distwq.is_controller:
         distwq.run(
             fun_name="gfsctrl",
@@ -1595,8 +1692,9 @@ def run(
             fun_name="gfswork",
             module_name="distgfs",
             broker_is_worker=not spawn_workers,
-            broker_fun_name=gfsopt_params.get("broker_fun_name", None),
-            broker_module_name=gfsopt_params.get("broker_module_name", None),
+            broker_fun_name=(
+                "gfsbroker" if gfsopt_params.get("broker_fun_name") else None
+            ),
             verbose=verbose,
             args=(
                 gfsopt_params,

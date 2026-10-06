@@ -1,6 +1,7 @@
 import dataclasses
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -75,8 +76,7 @@ def test_basic():
     # Create an optimizer parameter set
     distgfs_params = {
         "opt_id": "distgfs_levi",
-        "obj_fun_name": "obj_fun",
-        "obj_fun_module": "test_distgfs",
+        "obj_fun_name": "test_distgfs.obj_fun",
         "problem_parameters": problem_parameters,
         "space": space,
         "n_iter": 50,
@@ -93,8 +93,7 @@ def test_per_problem_tasks_levi():
     """per_problem_tasks=True dispatches one task per problem; both ids must converge."""
     distgfs_params = {
         "opt_id": "distgfs_levi_pp",
-        "obj_fun_name": "obj_fun_multi_int",
-        "obj_fun_module": "test_distgfs",
+        "obj_fun_name": "test_distgfs.obj_fun_multi_int",
         "problem_parameters": {"y": 1.0},
         "space": {"x": [-4.5, 4.5]},
         "problem_ids": {0, 1},
@@ -119,8 +118,7 @@ def test_per_problem_tasks_checkpoint():
     try:
         distgfs_params = {
             "opt_id": "distgfs_levi_pp_ckpt",
-            "obj_fun_name": "obj_fun_multi_int",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun_multi_int",
             "problem_parameters": {"y": 1.0},
             "space": {"x": [-4.5, 4.5]},
             "problem_ids": {0, 1},
@@ -155,8 +153,7 @@ def test_per_problem_tasks_balanced():
     try:
         distgfs_params = {
             "opt_id": "distgfs_levi_pp_bal",
-            "obj_fun_name": "obj_fun_multi_int",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun_multi_int",
             "problem_parameters": {"y": 1.0},
             "space": {"x": [-4.5, 4.5]},
             "problem_ids": problem_ids,
@@ -187,8 +184,7 @@ def test_string_problem_ids():
     try:
         distgfs_params = {
             "opt_id": "test_str_pids",
-            "obj_fun_name": "obj_fun_multi_str",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun_multi_str",
             "problem_parameters": {"y": 1.0},
             "space": {"x": [-4.5, 4.5]},
             "problem_ids": {"A", "B"},
@@ -224,8 +220,7 @@ def test_initial_evals_seed_fresh_run():
     seed_x = 1.0 / 0.4
     distgfs_params = {
         "opt_id": "distgfs_levi_seed",
-        "obj_fun_name": "obj_fun",
-        "obj_fun_module": "test_distgfs",
+        "obj_fun_name": "test_distgfs.obj_fun",
         "problem_parameters": problem_parameters,
         "space": space,
         "n_iter": 3,
@@ -257,8 +252,7 @@ def test_initial_evals_merge_with_checkpoint():
     try:
         distgfs_params_first = {
             "opt_id": "distgfs_levi_merge",
-            "obj_fun_name": "obj_fun",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun",
             "problem_parameters": problem_parameters,
             "space": space,
             "n_iter": n_iter_first,
@@ -271,8 +265,7 @@ def test_initial_evals_merge_with_checkpoint():
 
         distgfs_params_second = {
             "opt_id": "distgfs_levi_merge",
-            "obj_fun_name": "obj_fun",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun",
             "problem_parameters": problem_parameters,
             "space": space,
             "n_iter": n_iter_second,
@@ -366,8 +359,7 @@ def record_params(opt_id, fpath, n_iter=6, **extra):
     are not exactly representable in float32."""
     params = {
         "opt_id": opt_id,
-        "obj_fun_name": "obj_fun_record",
-        "obj_fun_module": "test_distgfs",
+        "obj_fun_name": "test_distgfs.obj_fun_record",
         "problem_parameters": {"y": 0.1},
         "space": {"x": [0.1, 0.7]},
         "n_iter": n_iter,
@@ -533,8 +525,7 @@ def test_parameter_dtype_multi_problem(tmp_path):
     distgfs.run(
         {
             "opt_id": "pd_multi",
-            "obj_fun_name": "obj_fun_multi_int",
-            "obj_fun_module": "test_distgfs",
+            "obj_fun_name": "test_distgfs.obj_fun_multi_int",
             "problem_parameters": {"y": 1.0},
             "space": {"x": [-4.5, 4.5]},
             "problem_ids": {0, 1},
@@ -792,8 +783,7 @@ def obj_fun_feature(pp, pid):
 def loop_params(opt_id, n_iter, n_max_tasks=1, **extra):
     params = {
         "opt_id": opt_id,
-        "obj_fun_name": "obj_fun_pids",
-        "obj_fun_module": "test_distgfs",
+        "obj_fun_name": "test_distgfs.obj_fun_pids",
         "problem_parameters": {"y": 0.1},
         "space": {"x": [0.1, 0.7]},
         "n_iter": n_iter,
@@ -808,7 +798,7 @@ def multi_params(opt_id, n_iter, problem_ids, per_problem, n_max_tasks=1, **extr
         opt_id,
         n_iter,
         n_max_tasks,
-        obj_fun_name="obj_fun_multi_pids",
+        obj_fun_name="test_distgfs.obj_fun_multi_pids",
         problem_ids=problem_ids,
         per_problem_tasks=per_problem,
         **extra,
@@ -933,7 +923,7 @@ def test_loop_out_of_order_features(tmp_path):
             "loop_feat",
             n_iter=6,
             n_max_tasks=3,
-            obj_fun_name="obj_fun_feature",
+            obj_fun_name="test_distgfs.obj_fun_feature",
             feature_dtypes=[("xcopy", np.float64)],
             file_path=fpath,
             save=True,
@@ -1258,7 +1248,7 @@ def test_loop_wrapped_results_with_features(tmp_path, result_types):
             "loop_wrap_feat",
             n_iter=6,
             n_max_tasks=3,
-            obj_fun_name="obj_fun_feature",
+            obj_fun_name="test_distgfs.obj_fun_feature",
             feature_dtypes=[("xcopy", np.float64)],
             file_path=fpath,
             save=True,
@@ -1323,11 +1313,9 @@ def init_params(opt_id, **extra):
     params = loop_params(
         opt_id,
         n_iter=2,
-        controller_init_fun_name="controller_init",
-        controller_init_fun_module="test_distgfs",
+        controller_init_fun_name="test_distgfs.controller_init",
         controller_init_fun_args={"label": opt_id},
-        reduce_fun_name="mean_reduce",
-        reduce_fun_module="test_distgfs",
+        reduce_fun_name="test_distgfs.mean_reduce",
         reduce_fun_args={"offset": 0.25},
     )
     params.update(extra)
@@ -1379,8 +1367,7 @@ def test_gfsinit_obj_fun_init(init_calls):
     arguments may be omitted."""
     params = init_params(
         "init_factory",
-        obj_fun_init_name="obj_fun_init",
-        obj_fun_init_module="test_distgfs",
+        obj_fun_init_name="test_distgfs.obj_fun_init",
         obj_fun_init_args={"scale": 2},
     )
     del params["obj_fun_name"]
@@ -1394,7 +1381,7 @@ def test_gfsinit_obj_fun_init(init_calls):
 
 
 def test_gfsinit_unknown_reduce_fun_name_raises(init_calls):
-    with pytest.raises(NameError, match="no_such_reduce"):
+    with pytest.raises(ImportError, match="no_such_reduce"):
         distgfs.gfsinit(
             init_params("init_bad_reduce", reduce_fun_name="no_such_reduce")
         )
@@ -1413,3 +1400,137 @@ def test_loop_reduce_fun_name_single_process(result_types, init_calls):
     for e in evals:
         assert math.isclose(e.y, -((e.x[0] - 0.3) ** 2) + 0.5 + 0.25)
     assert CONTROLLER_INIT_CALLS == [{"label": "loop_reduce_name"}]
+
+
+# ---------------------------------------------------------------------------
+# Function paths ("module.name") and the removed *_module keys
+# ---------------------------------------------------------------------------
+
+
+class PathHolder:
+    """Module-level class whose method is reached through an attribute path."""
+
+    @staticmethod
+    def method():
+        return "held"
+
+
+def test_resolve_module_function():
+    assert distgfs.resolve_object_path("test_distgfs.obj_fun_pids") is obj_fun_pids
+
+
+def test_resolve_package_module():
+    """The longest importable prefix is the module: os.path, not os."""
+    assert distgfs.resolve_object_path("os.path.join") is os.path.join
+
+
+def test_resolve_attribute_chain():
+    assert distgfs.resolve_object_path("test_distgfs.PathHolder.method")() == "held"
+
+
+def test_resolve_main(monkeypatch):
+    """A name without an importable module part is looked up in __main__,
+    including attribute chains; '__main__.' may also be given."""
+    main = sys.modules["__main__"]
+    monkeypatch.setattr(main, "distgfs_main_fun", obj_fun_pids, raising=False)
+    monkeypatch.setattr(main, "DistgfsMainHolder", PathHolder, raising=False)
+    assert distgfs.resolve_object_path("distgfs_main_fun") is obj_fun_pids
+    assert distgfs.resolve_object_path("__main__.distgfs_main_fun") is obj_fun_pids
+    assert distgfs.resolve_object_path("DistgfsMainHolder.method")() == "held"
+
+
+def test_resolve_missing_attribute_raises():
+    with pytest.raises(ImportError, match="'test_distgfs' has no attribute 'no_such'"):
+        distgfs.resolve_object_path("test_distgfs.no_such")
+
+
+def test_resolve_missing_module_raises():
+    with pytest.raises(ImportError, match="no module 'no_such_module_xyz'"):
+        distgfs.resolve_object_path("no_such_module_xyz.obj_fun")
+
+
+def test_resolve_missing_name_in_main_raises():
+    with pytest.raises(ImportError, match="'__main__' has no attribute"):
+        distgfs.resolve_object_path("no_such_main_fun_xyz")
+
+
+def test_resolve_broken_module_import_propagates(tmp_path, monkeypatch):
+    """A module that exists but fails to import one of its own dependencies
+    reports that failure instead of being skipped."""
+    (tmp_path / "distgfs_broken_mod_xyz.py").write_text(
+        "import no_such_dependency_xyz\n\ndef fun():\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ModuleNotFoundError, match="no_such_dependency_xyz"):
+        distgfs.resolve_object_path("distgfs_broken_mod_xyz.fun")
+
+
+@pytest.mark.parametrize("path", ["", ".fun", "mod..fun", "fun.", "mod.1fun", "a b"])
+def test_resolve_malformed_path_raises(path):
+    with pytest.raises(ImportError, match="not a valid"):
+        distgfs.resolve_object_path(path)
+
+
+@pytest.mark.parametrize("path", [None, 3, ["test_distgfs", "obj_fun"]])
+def test_resolve_non_string_raises(path):
+    with pytest.raises(TypeError):
+        distgfs.resolve_object_path(path)
+
+
+def test_resolve_callable_rejects_data():
+    with pytest.raises(TypeError, match="obj_fun_name 'test_distgfs.RECORDED_CALLS'"):
+        distgfs.resolve_callable("test_distgfs.RECORDED_CALLS", "obj_fun_name")
+
+
+@pytest.mark.parametrize("key", sorted(distgfs.REMOVED_MODULE_KEYS))
+def test_removed_module_keys_raise(key, init_calls):
+    """Each removed key is rejected, by gfsinit and by run(), with a hint
+    naming the key that now carries the module."""
+    params = loop_params(f"removed_{key}", n_iter=1)
+    params[key] = "test_distgfs"
+    hint = f"{distgfs.REMOVED_MODULE_KEYS[key]}='test_distgfs.<name>'"
+    with pytest.raises(TypeError, match=re.escape(hint)):
+        distgfs.gfsinit(dict(params))
+    with pytest.raises(TypeError, match=key):
+        distgfs.run(dict(params))
+
+
+def test_obj_fun_name_with_module_runs():
+    """An end-to-end run with a module path finds and calls the objective."""
+    RECORDED_CALLS.clear()
+    distgfs.run(loop_params("path_run", n_iter=3))
+    assert len(RECORDED_CALLS) == 3
+
+
+BROKER_CALLS = []
+
+
+def broker_fun(broker, gfsopt_params, verbose):
+    BROKER_CALLS.append((broker, gfsopt_params["opt_id"], verbose))
+    return "broker done"
+
+
+def test_gfsbroker_calls_named_function():
+    BROKER_CALLS.clear()
+    params = {"opt_id": "broker", "broker_fun_name": "test_distgfs.broker_fun"}
+    assert distgfs.gfsbroker("B", params, True) == "broker done"
+    assert BROKER_CALLS == [("B", "broker", True)]
+
+
+@pytest.mark.parametrize("broker_name", [None, "test_distgfs.broker_fun"])
+def test_run_worker_passes_trampoline(monkeypatch, broker_name):
+    """On a worker rank, run() names distgfs's own trampoline to distwq,
+    because distwq looks the broker function up in module distgfs."""
+    captured = {}
+    monkeypatch.setattr(distwq, "run", lambda **kwargs: captured.update(kwargs))
+    set_roles(monkeypatch, is_controller=False, is_worker=True)
+    params = loop_params("broker_run", n_iter=1)
+    if broker_name is not None:
+        params["broker_fun_name"] = broker_name
+    distgfs.run(params)
+    assert captured["module_name"] == "distgfs"
+    assert "broker_module_name" not in captured
+    expected = None if broker_name is None else "gfsbroker"
+    assert captured["broker_fun_name"] == expected
+    if expected is not None:
+        assert distwq.get_fun(expected, "distgfs") is distgfs.gfsbroker

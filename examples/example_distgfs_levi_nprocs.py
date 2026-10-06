@@ -40,10 +40,8 @@ if __name__ == "__main__":
     # Create an optimizer parameter set
     distgfs_params = {
         "opt_id": "distgfs_levi",
-        "obj_fun_name": "obj_fun",
-        "obj_fun_module": "example_distgfs_levi_nprocs",
-        "reduce_fun_name": "reduce_fun",
-        "reduce_fun_module": "example_distgfs_levi_nprocs",
+        "obj_fun_name": "example_distgfs_levi_nprocs.obj_fun",
+        "reduce_fun_name": "example_distgfs_levi_nprocs.reduce_fun",
         "problem_parameters": problem_parameters,
         "space": space,
         "n_iter": 20,
