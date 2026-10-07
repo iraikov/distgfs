@@ -1,4 +1,3 @@
-import dataclasses
 import math
 import os
 import re
@@ -6,12 +5,15 @@ import shutil
 import sys
 import tempfile
 import warnings
+from types import SimpleNamespace
 
 import distwq
 import dlib
 import h5py
 import numpy as np
 import pytest
+
+from distwq.future import TaskController
 
 import distgfs
 
@@ -674,6 +676,9 @@ def test_h5_parameter_dtype_mixed_fields_raises(tmp_path):
 class FakeController:
     """Stand-in for distwq.MPIController that mimics MPI timing in one process.
 
+    It is used underneath a real distwq.future.TaskController (see
+    fake_session()), so that the controller loop runs on real futures.
+
     Each task runs as soon as it is submitted, but its result is held back,
     as if a worker were still computing it.  Every call to process() releases
     held results according to 'pattern', a cycle of counts ("all" releases
@@ -683,7 +688,9 @@ class FakeController:
     as distwq's submit_call() does through its own process() call.
 
     'wrap', if given, is applied to every result before it is held, to
-    imitate the result types of a particular distwq version.
+    imitate the result types of distwq.  A task that raises is recorded as
+    distwq records a captured failure: its result is the description from
+    distwq.task_failure(), and its id is added to failed_tasks.
 
     A blocking process() with nothing held raises AssertionError, turning
     a hang into a test failure.
@@ -695,7 +702,6 @@ class FakeController:
         reverse=False,
         release_on_submit=False,
         limit=None,
-        extra_ids=(),
         wrap=None,
     ):
         self.pattern = list(pattern)
@@ -704,13 +710,21 @@ class FakeController:
         self.reverse = reverse
         self.release_on_submit = release_on_submit
         self.limit = limit
-        self.extra_ids = list(extra_ids)
         self.held = []
         self.ready = []
         self.count = 0
         self.inflight_at_submit = []
         self.submitted = []
         self.blocked_with_ready = 0
+        self.failed_tasks = set()
+        # Read by TaskController to tell whether a task is still known.
+        self.waiting = {}
+        self.assigned = {}
+        self.result_queue = []
+
+    @property
+    def results(self):
+        return {task_id for task_id, _ in self.held + self.ready}
 
     def _outstanding(self):
         return len(self.held) + len(self.ready)
@@ -722,7 +736,9 @@ class FakeController:
         for _ in range(n):
             self.ready.append(self.held.pop() if self.reverse else self.held.pop(0))
 
-    def submit_call(self, name_to_call, args=(), kwargs=None, module_name="__main__"):
+    def submit_call(
+        self, name_to_call, args=(), kwargs=None, module_name="__main__", time_est=1
+    ):
         if self.release_on_submit:
             self._release()
         outstanding = self._outstanding()
@@ -734,9 +750,14 @@ class FakeController:
         self.submitted.append((index, tuple(vals_dict)))
         task_id = self.count
         self.count += 1
-        result = fun(*args, **(kwargs or {}))
-        if self.wrap is not None:
-            result = self.wrap(result)
+        try:
+            result = fun(*args, **(kwargs or {}))
+        except Exception as e:
+            result = distwq.task_failure(e)
+            self.failed_tasks.add(task_id)
+        else:
+            if self.wrap is not None:
+                result = self.wrap(result)
         self.held.append((task_id, result))
         return task_id
 
@@ -748,13 +769,17 @@ class FakeController:
         self._release()
 
     def probe_all_next_results(self):
-        ret = [(task_id, {}) for task_id in self.extra_ids] + self.ready
-        self.extra_ids = []
+        ret = self.ready
         self.ready = []
         return ret
 
-    def info(self):
-        pass
+    def summary(self):
+        return ""
+
+
+def fake_session(ctl):
+    """Return a real TaskController that drives the FakeController 'ctl'."""
+    return TaskController(SimpleNamespace(_controller=ctl, worker_config=None))
 
 
 RECORDED_CALLS = []
@@ -794,11 +819,11 @@ def loop_params(opt_id, n_iter, n_max_tasks=1, **extra):
 
 
 def multi_params(opt_id, n_iter, problem_ids, per_problem, n_max_tasks=1, **extra):
+    extra.setdefault("obj_fun_name", "test_distgfs.obj_fun_multi_pids")
     return loop_params(
         opt_id,
         n_iter,
         n_max_tasks,
-        obj_fun_name="test_distgfs.obj_fun_multi_pids",
         problem_ids=problem_ids,
         per_problem_tasks=per_problem,
         **extra,
@@ -815,7 +840,9 @@ def test_loop_batch_exact_count():
     """Batch mode submits exactly n_iter tasks, and only when none are in
     flight, even when n_max_tasks does not divide n_iter."""
     ctl = FakeController(limit=2)
-    distgfs.gfsctrl(ctl, loop_params("loop_batch", n_iter=5, n_max_tasks=2))
+    distgfs.gfsctrl(
+        fake_session(ctl), loop_params("loop_batch", n_iter=5, n_max_tasks=2)
+    )
     assert ctl.inflight_at_submit == [0, 1, 0, 1, 0]
     assert n_evals("loop_batch") == 5
     assert ctl._outstanding() == 0
@@ -824,7 +851,9 @@ def test_loop_batch_exact_count():
 @pytest.mark.timeout(60)
 def test_loop_batch_limit_larger_than_total():
     ctl = FakeController()
-    distgfs.gfsctrl(ctl, loop_params("loop_batch_big", n_iter=5, n_max_tasks=10))
+    distgfs.gfsctrl(
+        fake_session(ctl), loop_params("loop_batch_big", n_iter=5, n_max_tasks=10)
+    )
     assert ctl.inflight_at_submit == [0, 1, 2, 3, 4]
     assert n_evals("loop_batch_big") == 5
 
@@ -864,7 +893,7 @@ def test_loop_save_count(tmp_path, monkeypatch, pattern):
     fpath = str(tmp_path / "ckpt.h5")
     ctl = FakeController(pattern=pattern)
     distgfs.gfsctrl(
-        ctl,
+        fake_session(ctl),
         loop_params("loop_save", n_iter=20, file_path=fpath, save=True, save_iter=5),
     )
     assert len(calls) == 4
@@ -878,7 +907,8 @@ def test_loop_results_during_submit():
     before the controller blocks again, and the work still completes."""
     ctl = FakeController(pattern=(1,), release_on_submit=True, limit=2)
     distgfs.gfsctrl(
-        ctl, multi_params("loop_submit", 6, {0, 1, 2}, per_problem=True, n_max_tasks=2)
+        fake_session(ctl),
+        multi_params("loop_submit", 6, {0, 1, 2}, per_problem=True, n_max_tasks=2),
     )
     assert ctl.blocked_with_ready == 0
     for problem_id in (0, 1, 2):
@@ -891,7 +921,8 @@ def test_loop_rolling_fairness_out_of_order():
     within n_max_tasks, and gives every problem exactly n_iter tasks."""
     ctl = FakeController(pattern=(1,), reverse=True, limit=2)
     distgfs.gfsctrl(
-        ctl, multi_params("loop_fair", 4, {0, 1, 2}, per_problem=True, n_max_tasks=2)
+        fake_session(ctl),
+        multi_params("loop_fair", 4, {0, 1, 2}, per_problem=True, n_max_tasks=2),
     )
     assert max(ctl.inflight_at_submit) == 1
     assert any(n > 0 for n in ctl.inflight_at_submit)
@@ -906,7 +937,8 @@ def test_loop_round_robin_order():
     all of its tasks first."""
     ctl = FakeController()
     distgfs.gfsctrl(
-        ctl, multi_params("loop_rr", 3, {2, 0, 1}, per_problem=True, n_max_tasks=1)
+        fake_session(ctl),
+        multi_params("loop_rr", 3, {2, 0, 1}, per_problem=True, n_max_tasks=1),
     )
     assert [ids for _, ids in ctl.submitted] == [(0,), (1,), (2,)] * 3
 
@@ -918,7 +950,7 @@ def test_loop_out_of_order_features(tmp_path):
     fpath = str(tmp_path / "ckpt.h5")
     ctl = FakeController(reverse=True)
     distgfs.gfsctrl(
-        ctl,
+        fake_session(ctl),
         loop_params(
             "loop_feat",
             n_iter=6,
@@ -942,7 +974,7 @@ def test_loop_zero_iterations_saves_seeds(tmp_path):
     fpath = str(tmp_path / "ckpt.h5")
     ctl = FakeController()
     distgfs.gfsctrl(
-        ctl,
+        fake_session(ctl),
         loop_params(
             "loop_zero",
             n_iter=0,
@@ -967,13 +999,6 @@ def test_loop_default_n_max_tasks_terminates(per_problem):
     assert set(best) == {0, 1}
     for problem_id in (0, 1):
         assert n_evals("loop_default", problem_id) == 3
-
-
-@pytest.mark.timeout(60)
-def test_loop_unknown_task_id_raises():
-    ctl = FakeController(extra_ids=[999])
-    with pytest.raises(RuntimeError, match="999"):
-        distgfs.gfsctrl(ctl, loop_params("loop_unknown", n_iter=3))
 
 
 def test_save_iter_must_be_positive(tmp_path):
@@ -1040,101 +1065,50 @@ def test_ordered_problem_ids(ids, expected):
 
 
 # ---------------------------------------------------------------------------
-# Result forms: plain values and lists (distwq < 2.0), TaskResult and
-# CollectiveTaskResult (distwq 2.0)
+# Result forms: the objective's mapping, or a CollectiveTaskResult from a
+# worker group
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
-class StandInTaskResult:
-    """Stand-in for distwq.TaskResult when the installed distwq lacks it."""
-
-    value: object
-
-
-@dataclasses.dataclass(frozen=True)
-class StandInCollectiveTaskResult:
-    """Stand-in for distwq.CollectiveTaskResult."""
-
-    values: list
-
-
-@pytest.fixture
-def result_types(monkeypatch):
-    """Return (TaskResult, CollectiveTaskResult): distwq's own classes when
-    it defines them, otherwise stand-ins installed on the distwq module."""
-    if hasattr(distwq, "TaskResult") and hasattr(distwq, "CollectiveTaskResult"):
-        return distwq.TaskResult, distwq.CollectiveTaskResult
-    monkeypatch.setattr(distwq, "TaskResult", StandInTaskResult, raising=False)
-    monkeypatch.setattr(
-        distwq, "CollectiveTaskResult", StandInCollectiveTaskResult, raising=False
-    )
-    return StandInTaskResult, StandInCollectiveTaskResult
+CollectiveTaskResult = distwq.CollectiveTaskResult
 
 
 def must_not_reduce(values, **kwargs):
     raise AssertionError("reduce_fun must not be called")
 
 
-def group_result(form, values, types):
-    """A worker group's result in the given form: 'list' or 'collective'."""
-    return list(values) if form == "list" else types[1](list(values))
-
-
-def test_result_plain_dict_used_as_is(result_types):
+def test_result_plain_dict_used_as_is():
     res = {0: -1.0}
     assert distgfs._task_result_dict(1, res, must_not_reduce) is res
 
 
-def test_result_task_result_unwrapped(result_types):
-    task_result, _ = result_types
-    res = distgfs._task_result_dict(1, task_result({0: -1.0}), must_not_reduce)
-    assert res == {0: -1.0}
-
-
-@pytest.mark.parametrize("value", [None, [{0: -1.0}], -1.0])
-def test_result_task_result_not_a_dict_raises(result_types, value):
-    """A TaskResult holds one process's value; a list in it is not taken
-    for a group's results."""
-    task_result, _ = result_types
-    with pytest.raises(TypeError, match="objective function"):
-        distgfs._task_result_dict(1, task_result(value))
-
-
-@pytest.mark.parametrize("form", ["list", "collective"])
 @pytest.mark.parametrize(
     "values",
     [[{0: -1.0}], [{0: -1.0}, None, None], [None, {0: -1.0}]],
 )
-def test_result_group_single_value(result_types, form, values):
+def test_result_group_single_value(values):
     """Without reduce_fun, the one result that is not None is used."""
-    res = distgfs._task_result_dict(1, group_result(form, values, result_types))
+    res = distgfs._task_result_dict(1, CollectiveTaskResult(values))
     assert res == {0: -1.0}
 
 
-@pytest.mark.parametrize("form", ["list", "collective"])
-def test_result_group_several_values_need_reduce_fun(result_types, form):
-    res = group_result(form, [{0: -1.0}, None, {0: -2.0}], result_types)
+def test_result_group_several_values_need_reduce_fun():
+    res = CollectiveTaskResult([{0: -1.0}, None, {0: -2.0}])
     with pytest.raises(ValueError, match="2 sub-worker results.*reduce_fun"):
         distgfs._task_result_dict(1, res)
 
 
-@pytest.mark.parametrize("form", ["list", "collective"])
 @pytest.mark.parametrize(
     "values, message",
     [([None, None], "returned None"), ([], "no results")],
 )
 @pytest.mark.parametrize("reduce_fun", [None, must_not_reduce])
-def test_result_group_without_values_raises(
-    result_types, form, values, message, reduce_fun
-):
-    res = group_result(form, values, result_types)
+def test_result_group_without_values_raises(values, message, reduce_fun):
     with pytest.raises(ValueError, match=message):
-        distgfs._task_result_dict(1, res, reduce_fun)
+        distgfs._task_result_dict(1, CollectiveTaskResult(values), reduce_fun)
 
 
-@pytest.mark.parametrize("form", ["list", "collective"])
-def test_result_group_reduce_fun_receives_present_values(result_types, form):
+def test_result_group_reduce_fun_receives_present_values():
     """reduce_fun gets the results that are not None, in group order, and
     the keyword arguments in reduce_fun_args."""
     calls = []
@@ -1144,42 +1118,43 @@ def test_result_group_reduce_fun_receives_present_values(result_types, form):
         return {0: sum(v[0] for v in values)}
 
     first, second = {0: -1.0}, {0: -2.0}
-    res = group_result(form, [first, None, second], result_types)
+    res = CollectiveTaskResult([first, None, second])
     out = distgfs._task_result_dict(1, res, reduce_fun, {"scale": 2})
     assert out == {0: -3.0}
     assert calls == [([first, second], {"scale": 2})]
 
 
-@pytest.mark.parametrize("form", ["list", "collective"])
-def test_result_group_reduce_fun_on_single_value(result_types, form):
+def test_result_group_reduce_fun_on_single_value():
     """reduce_fun is still called when only one result is present."""
-    res = group_result(form, [{0: -1.0}, None], result_types)
+    res = CollectiveTaskResult([{0: -1.0}, None])
     out = distgfs._task_result_dict(1, res, lambda values: {0: len(values)})
     assert out == {0: 1}
 
 
-@pytest.mark.parametrize("form", ["list", "collective"])
 @pytest.mark.parametrize("returned", [None, [{0: -1.0}], -1.0])
-def test_result_reduce_fun_not_a_dict_raises(result_types, form, returned):
-    res = group_result(form, [{0: -1.0}, {0: -2.0}], result_types)
+def test_result_reduce_fun_not_a_dict_raises(returned):
+    res = CollectiveTaskResult([{0: -1.0}, {0: -2.0}])
     with pytest.raises(TypeError, match="reduce_fun"):
         distgfs._task_result_dict(1, res, lambda values: returned)
 
 
-@pytest.mark.parametrize("res", [(({0: -1.0}),), None, -1.0, "abc"])
-def test_result_stray_types_raise(result_types, res):
+@pytest.mark.parametrize(
+    "res",
+    [
+        (({0: -1.0}),),
+        None,
+        -1.0,
+        "abc",
+        [{0: -1.0}],
+        distwq.TaskResult({0: -1.0}),
+    ],
+)
+def test_result_stray_types_raise(res):
+    """Only a mapping or a CollectiveTaskResult is accepted.  A list is not
+    taken for a group's results, and a TaskResult never reaches distgfs,
+    because the futures layer unwraps it."""
     with pytest.raises(TypeError, match="task 1"):
-        distgfs._task_result_dict(1, res)
-
-
-def test_result_plain_forms_without_wrapper_classes(monkeypatch):
-    """Releases of distwq before 2.0 define neither wrapper class."""
-    monkeypatch.delattr(distwq, "TaskResult", raising=False)
-    monkeypatch.delattr(distwq, "CollectiveTaskResult", raising=False)
-    assert distgfs._task_result_dict(1, {0: -1.0}) == {0: -1.0}
-    assert distgfs._task_result_dict(1, [{0: -1.0}, None]) == {0: -1.0}
-    with pytest.raises(TypeError):
-        distgfs._task_result_dict(1, None)
+        distgfs._task_result_dict(1, res, must_not_reduce)
 
 
 def two_problem_optimizer(opt_id):
@@ -1195,55 +1170,55 @@ def two_problem_optimizer(opt_id):
     return gfsopt
 
 
-def test_update_result_value_collective(result_types):
-    _, collective_result = result_types
+def test_update_result_value_collective():
     gfsopt = two_problem_optimizer("update_collective")
     gfsopt.update_result_value(
-        7, collective_result([{0: -1.5, 1: -2.5}, None]), expected_ids=(0, 1)
+        7, CollectiveTaskResult([{0: -1.5, 1: -2.5}, None]), expected_ids=(0, 1)
     )
     for problem_id, y in ((0, -1.5), (1, -2.5)):
         ys = gfsopt.optimizer_dict[problem_id].get_function_evaluations()[1][0]
         assert [e.y for e in ys] == [y]
 
 
-def test_update_result_value_wrapped_missing_id(result_types):
-    """The problem-id check applies to the unwrapped result."""
-    task_result, _ = result_types
-    gfsopt = two_problem_optimizer("update_wrapped_missing")
+def test_update_result_value_collective_missing_id():
+    """The problem-id check applies to the combined result."""
+    gfsopt = two_problem_optimizer("update_collective_missing")
     with pytest.raises(ValueError, match="missing"):
-        gfsopt.update_result_value(7, task_result({0: -1.5}), expected_ids=(0, 1))
+        gfsopt.update_result_value(
+            7, CollectiveTaskResult([{0: -1.5}]), expected_ids=(0, 1)
+        )
 
 
 WRAPS = {
-    "task_result": lambda types: types[0],
-    "collective_with_none": lambda types: lambda r: types[1]([r, None]),
-    "plain_list": lambda types: lambda r: [r],
+    # Unwrapped by the TaskController, as for an ungrouped worker.
+    "task_result": distwq.TaskResult,
+    "collective_with_none": lambda r: CollectiveTaskResult([r, None]),
 }
 
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("wrap", sorted(WRAPS))
 @pytest.mark.parametrize("per_problem", [False, True])
-def test_loop_wrapped_results(result_types, wrap, per_problem):
+def test_loop_wrapped_results(wrap, per_problem):
     """The controller loop handles every result form in both modes."""
     opt_id = f"loop_wrap_{wrap}_{per_problem}"
-    ctl = FakeController(pattern=(1,), reverse=True, wrap=WRAPS[wrap](result_types))
+    ctl = FakeController(pattern=(1,), reverse=True, wrap=WRAPS[wrap])
     distgfs.gfsctrl(
-        ctl, multi_params(opt_id, 5, {0, 1}, per_problem=per_problem, n_max_tasks=2)
+        fake_session(ctl),
+        multi_params(opt_id, 5, {0, 1}, per_problem=per_problem, n_max_tasks=2),
     )
     for problem_id in (0, 1):
         assert n_evals(opt_id, problem_id) == 5
 
 
 @pytest.mark.timeout(60)
-def test_loop_wrapped_results_with_features(tmp_path, result_types):
+def test_loop_wrapped_results_with_features(tmp_path):
     """Features stay aligned with their parameters when results arrive in
     reverse order as CollectiveTaskResults."""
-    _, collective_result = result_types
     fpath = str(tmp_path / "ckpt.h5")
-    ctl = FakeController(reverse=True, wrap=lambda r: collective_result([None, r]))
+    ctl = FakeController(reverse=True, wrap=lambda r: CollectiveTaskResult([None, r]))
     distgfs.gfsctrl(
-        ctl,
+        fake_session(ctl),
         loop_params(
             "loop_wrap_feat",
             n_iter=6,
@@ -1268,13 +1243,14 @@ def mean_reduce(values, offset=0.0):
 
 
 @pytest.mark.timeout(60)
-def test_loop_reduce_fun_on_group_results(result_types):
+def test_loop_reduce_fun_on_group_results():
     """With reduce_fun, the optimizer records the reduced value of each
     task's group results."""
-    _, collective_result = result_types
-    ctl = FakeController(wrap=lambda r: collective_result([r, {0: r[0] + 1.0}, None]))
+    ctl = FakeController(
+        wrap=lambda r: CollectiveTaskResult([r, {0: r[0] + 1.0}, None])
+    )
     distgfs.gfsctrl(
-        ctl,
+        fake_session(ctl),
         loop_params(
             "loop_reduce",
             n_iter=6,
@@ -1388,12 +1364,11 @@ def test_gfsinit_unknown_reduce_fun_name_raises(init_calls):
 
 
 @pytest.mark.timeout(60)
-def test_loop_reduce_fun_name_single_process(result_types, init_calls):
+def test_loop_reduce_fun_name_single_process(init_calls):
     """reduce_fun_name now takes effect without MPI: group results are
     reduced by the named function."""
-    _, collective_result = result_types
-    ctl = FakeController(wrap=lambda r: collective_result([r, {0: r[0] + 1.0}]))
-    distgfs.gfsctrl(ctl, init_params("loop_reduce_name", n_iter=4))
+    ctl = FakeController(wrap=lambda r: CollectiveTaskResult([r, {0: r[0] + 1.0}]))
+    distgfs.gfsctrl(fake_session(ctl), init_params("loop_reduce_name", n_iter=4))
     evals = distgfs.gfsopt_dict["loop_reduce_name"].optimizer_dict[0]
     evals = evals.get_function_evaluations()[1][0]
     assert len(evals) == 4
@@ -1517,20 +1492,188 @@ def test_gfsbroker_calls_named_function():
     assert BROKER_CALLS == [("B", "broker", True)]
 
 
-@pytest.mark.parametrize("broker_name", [None, "test_distgfs.broker_fun"])
-def test_run_worker_passes_trampoline(monkeypatch, broker_name):
-    """On a worker rank, run() names distgfs's own trampoline to distwq,
-    because distwq looks the broker function up in module distgfs."""
-    captured = {}
-    monkeypatch.setattr(distwq, "run", lambda **kwargs: captured.update(kwargs))
-    set_roles(monkeypatch, is_controller=False, is_worker=True)
-    params = loop_params("broker_run", n_iter=1)
+class RecordingEnvironment:
+    """Stand-in for distwq.future.DistributedEnvironment that records how
+    run() constructs it, and acts as a worker rank that receives nothing."""
+
+    created = []
+
+    def __init__(self, config, worker_config, **kwargs):
+        self.config = config
+        self.worker_config = worker_config
+        self.kwargs = kwargs
+        self.worker_count = 0
+        RecordingEnvironment.created.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def controller_session(self):
+        return iter(())
+
+    def broadcast(self, value=None):
+        return "broadcast value"
+
+
+@pytest.fixture
+def recording_env(monkeypatch):
+    RecordingEnvironment.created.clear()
+    monkeypatch.setattr(distgfs, "DistributedEnvironment", RecordingEnvironment)
+    return RecordingEnvironment.created
+
+
+@pytest.mark.parametrize(
+    "spawn, broker_name",
+    [(False, None), (True, None), (True, "test_distgfs.broker_fun")],
+)
+def test_run_environment_settings(recording_env, spawn, broker_name):
+    """run() gives distwq gfswork as the worker init function, distgfs's
+    own broker trampoline when a broker function is named (spawn only),
+    and worker arguments without the saving keys; the caller's dict is
+    left as it is."""
+    params = loop_params("env_run", n_iter=1, file_path="unused.h5", save=True)
     if broker_name is not None:
         params["broker_fun_name"] = broker_name
-    distgfs.run(params)
-    assert captured["module_name"] == "distgfs"
-    assert "broker_module_name" not in captured
-    expected = None if broker_name is None else "gfsbroker"
-    assert captured["broker_fun_name"] == expected
-    if expected is not None:
-        assert distwq.get_fun(expected, "distgfs") is distgfs.gfsbroker
+    before = dict(params)
+    best = distgfs.run(params, spawn_workers=spawn, max_workers=3, nprocs_per_worker=2)
+    assert best == "broadcast value"
+    assert params == before
+    (env,) = recording_env
+    assert env.kwargs["worker_init"] is distgfs.gfswork
+    expected_broker = None if broker_name is None else distgfs.gfsbroker
+    assert env.kwargs["broker_init"] is expected_broker
+    worker_params, verbose = env.kwargs["init_args"]
+    assert "file_path" not in worker_params and "save" not in worker_params
+    assert worker_params["opt_id"] == "env_run"
+    assert verbose is False
+    assert env.config.resources.max_workers == 3
+    wc = env.worker_config
+    assert wc.nprocs_per_worker == 2
+    assert wc.broker_is_worker is (not spawn)
+    expected_method = (
+        distwq.GroupingMethod.GroupSpawn if spawn else distwq.GroupingMethod.GroupSplit
+    )
+    assert wc.grouping_method == expected_method
+
+
+def test_run_broker_fun_needs_spawn(recording_env):
+    params = loop_params("env_broker_split", n_iter=1)
+    params["broker_fun_name"] = "test_distgfs.broker_fun"
+    with pytest.raises(ValueError, match="spawn_workers"):
+        distgfs.run(params)
+    assert recording_env == []
+
+
+def test_run_unknown_broker_fun_raises_before_setup(recording_env):
+    params = loop_params("env_broker_missing", n_iter=1)
+    params["broker_fun_name"] = "test_distgfs.no_such_broker"
+    with pytest.raises(ImportError, match="no_such_broker"):
+        distgfs.run(params, spawn_workers=True)
+    assert recording_env == []
+
+
+# ---------------------------------------------------------------------------
+# Objective failures: checkpoint, then raise
+# ---------------------------------------------------------------------------
+
+
+class ObjectiveError(Exception):
+    pass
+
+
+FAIL_PID = 3
+
+
+def obj_fun_fail(pp, pid):
+    """Single-problem objective that raises on pid FAIL_PID."""
+    if pid == FAIL_PID:
+        raise ObjectiveError(f"objective failed at pid {pid}")
+    return -((pp["x"] - 0.3) ** 2)
+
+
+def obj_fun_multi_fail(pp, pid):
+    """Multi-problem objective that raises on pid FAIL_PID of problem 1."""
+    if pid == FAIL_PID and 1 in pp:
+        raise ObjectiveError(f"objective failed at pid {pid}")
+    return {
+        problem_id: -((params["x"] - 0.3) ** 2) for problem_id, params in pp.items()
+    }
+
+
+def checkpoint_counts(fpath, opt_id, problem_ids):
+    with h5py.File(fpath, "r") as f:
+        return {
+            problem_id: len(f[opt_id][str(problem_id)]["objectives"])
+            for problem_id in problem_ids
+        }
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("n_max_tasks", [1, 2])
+def test_loop_objective_failure_saves_then_raises(tmp_path, n_max_tasks):
+    """The objective's exception reaches the caller, after a checkpoint
+    with every result received before it; the failed point is not
+    recorded."""
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController(pattern=(1,))
+    params = loop_params(
+        "fail_batch",
+        n_iter=8,
+        n_max_tasks=n_max_tasks,
+        obj_fun_name="test_distgfs.obj_fun_fail",
+        file_path=fpath,
+        save=True,
+        save_iter=100,
+    )
+    with pytest.raises(ObjectiveError, match="pid 3"):
+        distgfs.gfsctrl(fake_session(ctl), params)
+    # Tasks for pids 0 .. 3 complete, in order, and the one for pid 3 fails.
+    assert n_evals("fail_batch") == FAIL_PID
+    assert checkpoint_counts(fpath, "fail_batch", [0]) == {0: FAIL_PID}
+
+
+@pytest.mark.timeout(60)
+def test_loop_objective_failure_keeps_results_of_same_wakeup(tmp_path):
+    """Results that arrive together with a failure are still recorded and
+    saved, whatever their order."""
+    fpath = str(tmp_path / "ckpt.h5")
+    ctl = FakeController(reverse=True)
+    params = multi_params(
+        "fail_rolling",
+        6,
+        {0, 1, 2},
+        per_problem=True,
+        n_max_tasks=12,
+        obj_fun_name="test_distgfs.obj_fun_multi_fail",
+        file_path=fpath,
+        save=True,
+        save_iter=100,
+    )
+    with pytest.raises(ObjectiveError):
+        distgfs.gfsctrl(fake_session(ctl), params)
+    # The first 12 tasks (pids 0 .. 3 of each problem) arrive together, and
+    # only problem 1's pid 3 fails.
+    expected = {0: 4, 1: 3, 2: 4}
+    assert {p: n_evals("fail_rolling", p) for p in (0, 1, 2)} == expected
+    assert checkpoint_counts(fpath, "fail_rolling", [0, 1, 2]) == expected
+
+
+@pytest.mark.timeout(60)
+def test_run_objective_failure_single_process(tmp_path):
+    """Without MPI, run() raises the objective's own exception type, and
+    the checkpoint holds the results before it."""
+    fpath = str(tmp_path / "ckpt.h5")
+    params = loop_params(
+        "fail_run",
+        n_iter=8,
+        obj_fun_name="test_distgfs.obj_fun_fail",
+        file_path=fpath,
+        save=True,
+        save_iter=2,
+    )
+    with pytest.raises(ObjectiveError, match="pid 3"):
+        distgfs.run(params)
+    assert checkpoint_counts(fpath, "fail_run", [0]) == {0: FAIL_PID}
