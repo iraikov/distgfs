@@ -1,4 +1,12 @@
-# .github/workflows/build.yaml
+# .github/workflows/main.yaml
+#
+# Installs distgfs and the "test" dependency group with pip, then runs the
+# test suite.  dlib has no binary wheels on PyPI and is compiled from source,
+# which takes several minutes; the pip cache keeps the built wheel between
+# runs, keyed on pyproject.toml.
+#
+# mpi4py needs an MPI library to build and run, so MPICH is installed from
+# apt.  The tests run in one process and do not start an MPI job.
 name: distgfs CI
 
 on:
@@ -6,29 +14,36 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.10", "3.12"]
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v7
 
-      - name: Setup Python
-        uses: actions/setup-python@v2
+      - name: Install MPI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libmpich-dev mpich
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Install dependencies
+      - name: Install distgfs and test dependencies
         run: |
-          sudo apt update -y && sudo apt upgrade 
-          sudo apt install build-essential mpich
           python -m pip install --upgrade pip
-          python -m pip install tox tox-gh-actions
+          python -m pip install . --group test
 
-      - name: Run tox
-        run: tox
+      - name: Run tests
+        run: python -m pytest tests/ -v
