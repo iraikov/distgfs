@@ -56,9 +56,13 @@ def find_launcher():
     if mpiexec is not None:
         candidates.append([mpiexec])
     for command in candidates:
+        # The probe gets an explicit environment, as the driver does.  Once
+        # this process has started MPI on Open MPI, its inherited
+        # environment holds Open MPI variables that make a child mpirun fail.
         try:
             probe = subprocess.run(
                 command + ["-n", "2", sys.executable, "-c", PROBE],
+                env=driver_env(),
                 capture_output=True,
                 text=True,
                 timeout=60,

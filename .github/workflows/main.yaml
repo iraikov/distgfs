@@ -1,14 +1,12 @@
 # .github/workflows/main.yaml
 #
-# Installs distgfs and its locked dependencies with uv, then runs the test
-# suite.  dlib has no binary wheels on PyPI and is compiled from source, which
-# takes several minutes; the uv cache keeps the built wheel between runs, keyed
-# on uv.lock.
+# Installs distgfs and the "test" dependency group with pip, then runs the
+# test suite.  The setup follows the distwq CI: mpi4py is built against
+# Open MPI from apt, which can also spawn processes (Ubuntu's MPICH cannot).
 #
-# mpi4py needs an MPI library at run time, so MPICH is installed from apt.
-# The Open MPI launcher is installed as well: tests/test_distgfs_mpi.py uses
-# /usr/bin/mpirun.openmpi when the MPICH launcher cannot start a multi-process
-# world, and skips itself if no launcher works.
+# dlib has no binary wheels on PyPI and is compiled from source, which takes
+# several minutes; the pip cache keeps the built wheel between runs, keyed on
+# pyproject.toml.
 name: distgfs CI
 
 on:
@@ -21,28 +19,38 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    env:
+      MPI4PY_MPIABI: openmpi
+      PYTHONUNBUFFERED: "1"
+      # The launcher for tests/test_distgfs_mpi.py.  Its jobs use three
+      # ranks, which may be more than the runner has cores.
+      DISTGFS_TEST_MPIEXEC: "mpirun --oversubscribe -x PYTHONPATH -x MPI4PY_MPIABI"
 
     steps:
-      - name: Checkout sources
+      - name: Check out sources
         uses: actions/checkout@v7
 
-      - name: Install MPI
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libmpich-dev mpich openmpi-bin
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v10.3.3
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-          enable-cache: true
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Install dependencies
-        run: uv sync --locked --group test
+      - name: Install Open MPI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openmpi-bin libopenmpi-dev
 
-      - name: Run tests
-        run: uv run --locked --group test pytest tests/ -v
+      - name: Install distgfs and its test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group test
+
+      - name: Run the tests
+        run: python -m pytest tests/ -v
