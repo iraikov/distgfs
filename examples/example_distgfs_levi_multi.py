@@ -37,8 +37,7 @@ if __name__ == "__main__":
     distgfs_params = {
         "opt_id": "distgfs_levi_multi",
         "problem_ids": set([0, 1]),
-        "obj_fun_name": "obj_fun",
-        "obj_fun_module": "example_distgfs_levi_multi",
+        "obj_fun_name": "example_distgfs_levi_multi.obj_fun",
         "problem_parameters": problem_parameters,
         "space": space,
         "n_iter": 10,

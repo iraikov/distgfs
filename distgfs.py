@@ -4,14 +4,35 @@ import logging
 import os
 import sys
 import warnings
+from collections.abc import Mapping
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 ProblemId = Union[int, str]
 
 import distwq
 import dlib
 import numpy as np
+from distwq.config import Config, LoggingConfig, ResourceConfig, WorkerGroupConfig
+from distwq.future import (
+    FIRST_COMPLETED,
+    ControllerExitedError,
+    DistributedEnvironment,
+    DistributedFuture,
+    TaskController,
+    wait,
+)
 from dlib import function_evaluation, function_spec
 from h5py._hl.dataset import Dataset
 from h5py._hl.files import File
@@ -135,6 +156,72 @@ def validate_inputs(
                 )
 
 
+def _group_result_dict(
+    task_id: int,
+    values: List[Any],
+    reduce_fun: Optional[Callable],
+    reduce_fun_args: Optional[Dict[str, Any]],
+) -> Any:
+    """Combine the per-process results of a worker group into one result.
+
+    Processes that returned None are left out.  If one result remains it
+    is used as it is, unless reduce_fun is given, in which case reduce_fun
+    receives the list of remaining results.  More than one remaining
+    result requires reduce_fun.
+    """
+    if not values:
+        raise ValueError(f"task {task_id}: the worker group returned no results")
+    present = [value for value in values if value is not None]
+    if not present:
+        raise ValueError(
+            f"task {task_id}: every process of the worker group returned None "
+            f"({len(values)} results), so there is no result to use"
+        )
+    if reduce_fun is not None:
+        return reduce_fun(present, **(reduce_fun_args or {}))
+    if len(present) > 1:
+        raise ValueError(
+            f"task {task_id} returned {len(present)} sub-worker results but no "
+            "reduce_fun is specified. Provide reduce_fun to merge them."
+        )
+    return present[0]
+
+
+def _task_result_dict(
+    task_id: int,
+    res: Any,
+    reduce_fun: Optional[Callable] = None,
+    reduce_fun_args: Optional[Dict[str, Any]] = None,
+) -> Mapping:
+    """Return the {problem_id: value} mapping held in the result of a task.
+
+    The result is what the task's future returned.  A worker group gives a
+    distwq.CollectiveTaskResult, whose values are combined by
+    _group_result_dict(); a single process gives the objective's mapping
+    itself.  reduce_fun is applied only to the results of a worker group.
+
+    :raises ValueError: if a worker group gives no usable result, or more
+        than one without reduce_fun.
+    :raises TypeError: if the result is not a mapping.
+    """
+    source = "the objective function"
+    match res:
+        case distwq.CollectiveTaskResult():
+            rres = _group_result_dict(
+                task_id, list(res.values), reduce_fun, reduce_fun_args
+            )
+            if reduce_fun is not None:
+                source = "reduce_fun"
+        case _:
+            rres = res
+    if not isinstance(rres, Mapping):
+        raise TypeError(
+            f"task {task_id}: expected a dict of problem ids from {source}, "
+            f"got {type(rres).__name__}"
+        )
+    return rres
+
+
 class DistGFSOptimizer:
     def __init__(
         self,
@@ -198,9 +285,15 @@ class DistGFSOptimizer:
             ``{'alpha': (0.65, 0.85), 'gamma': (1, 8)}``. If both bounds for a
             parameter are Ints, then only integers within the (inclusive) range
             will be sampled and tested.
-        :param func reduce_fun: function to reduce multiple results per evaluation
-            obtained from each distributed worker. Must take as argument a list
-            of objective evaluations.
+        :param func reduce_fun: function to combine the results of one
+            evaluation computed by a worker group. distgfs.run() always
+            uses worker groups, of ``nprocs_per_worker`` processes, so
+            with run() it is called for every result. It receives the list of
+            the group's results, leaving out processes that returned None,
+            followed by the keyword arguments in 'reduce_fun_args', and must
+            return a single result of the form ``{problem_id: value}``. It is
+            not called for results from a single process. Without it, a
+            group must produce exactly one result that is not None.
         :param int n_iter: (optional) Number of times to sample and test params.
         :param int save_iter: (optional) How often to save progress.
         :param str file_path: (optional) File name for restoring
@@ -251,6 +344,10 @@ class DistGFSOptimizer:
 
         self.parameter_dtype = validate_parameter_dtype(parameter_dtype)
         validate_inputs(problem_parameters, space, save, file_path, opt_id)
+        if save and save_iter < 1:
+            raise ValueError(
+                f"save_iter must be at least 1 when saving, not {save_iter}"
+            )
 
         eps = solver_epsilon
         noise_mag = relative_noise_magnitude
@@ -328,6 +425,11 @@ class DistGFSOptimizer:
         has_problem_ids = problem_ids is not None
         if not has_problem_ids:
             problem_ids = set([0])
+        elif len(problem_ids) == 0:
+            raise ValueError(
+                "problem_ids must name at least one problem; "
+                "omit it to optimize a single problem"
+            )
 
         for label, seed_dict in (
             ("initial_evals", initial_evals),
@@ -535,28 +637,35 @@ class DistGFSOptimizer:
             self.logger.info(f"Best eval so far for: {res}@{prms}")
 
     def update_result_value(
-        self, task_id: int, res: Dict[ProblemId, Tuple[float, ndarray]]
+        self,
+        task_id: int,
+        res: Any,
+        expected_ids: Optional[Tuple[ProblemId, ...]] = None,
     ) -> None:
-        if isinstance(res, list):
-            # MPICollectiveBroker path: res is a list with one entry per
-            # contributing sub-worker rank.  reduce_fun, when provided, is
-            # responsible for merging the list into a single result dict
-            # (e.g. averaging across replicates).  Without reduce_fun the
-            # first element is used, which is correct for nprocs_per_worker=1.
-            if self.reduce_fun is not None:
-                rres = self.reduce_fun(res, **self.reduce_fun_args)
-            elif len(res) == 1:
-                rres = res[0]
-            else:
+        """Pass the result of task 'task_id' to the optimizer of each problem.
+
+        :param res: The result returned by the task's future: the
+            objective's mapping, or a CollectiveTaskResult from a worker
+            group.  See _task_result_dict().
+        :param expected_ids: (optional) The problem ids the task was
+            submitted for.  If given, the result must hold exactly these
+            ids; otherwise ValueError is raised before any value is set.
+        """
+        rres = _task_result_dict(task_id, res, self.reduce_fun, self.reduce_fun_args)
+        if expected_ids is not None:
+            missing = set(expected_ids) - set(rres)
+            unexpected = set(rres) - set(expected_ids)
+            if missing or unexpected:
+                problems = []
+                if missing:
+                    problems.append(f"missing ids {sorted(map(str, missing))}")
+                if unexpected:
+                    problems.append(f"unexpected ids {sorted(map(str, unexpected))}")
                 raise ValueError(
-                    f"update_result_value: task {task_id} returned "
-                    f"{len(res)} sub-worker results but no reduce_fun "
-                    "is specified. Provide reduce_fun to merge them."
+                    f"update_result_value: task {task_id} was submitted for "
+                    f"problem ids {sorted(map(str, expected_ids))}, but its "
+                    f"result has {' and '.join(problems)}"
                 )
-        else:
-            # Plain MPIWorker or no-MPI path: res is the raw result dict.
-            # reduce_fun is not called here - there is nothing to reduce.
-            rres = res
         for problem_id in rres:
             eval_req = self.evals[problem_id][task_id]
             parameters = list(eval_req.x)
@@ -1190,179 +1299,330 @@ def eval_obj_fun_mp(obj_fun, pp, space_params, is_int, problem_ids, i, space_val
     return result_dict
 
 
+# gfsopt_params keys that gave the module of a *_fun_name before the names
+# became paths, and the name key that now carries the module.
+REMOVED_MODULE_KEYS = {
+    "obj_fun_module": "obj_fun_name",
+    "obj_fun_init_module": "obj_fun_init_name",
+    "controller_init_fun_module": "controller_init_fun_name",
+    "reduce_fun_module": "reduce_fun_name",
+    "broker_module_name": "broker_fun_name",
+}
+
+
+def check_removed_module_keys(gfsopt_params: Dict[str, Any]) -> None:
+    """Raise TypeError if gfsopt_params uses a removed *_module key.
+
+    Functions are now named by a single path such as "mymodule.obj_fun",
+    so a separate module key would be ignored.
+    """
+    found = sorted(key for key in REMOVED_MODULE_KEYS if key in gfsopt_params)
+    if found:
+        hints = ", ".join(
+            f"{key} -> {REMOVED_MODULE_KEYS[key]}='{gfsopt_params[key]}.<name>'"
+            for key in found
+        )
+        raise TypeError(
+            f"distgfs: gfsopt_params keys {found} are no longer supported; give "
+            f"the module as part of the function name instead ({hints})"
+        )
+
+
+def resolve_object_path(path: str) -> Any:
+    """Return the object named by 'path'.
+
+    A path has the form "module.name", for example "mymodule.obj_fun" or
+    "mypackage.sub.obj_fun".  The longest leading part of the path that
+    names an importable module is taken as the module, and the rest is
+    looked up in it as a chain of attributes, so that "mymodule.Model.run"
+    also works.  A path with no importable module part, such as
+    "obj_fun", names an object in __main__.
+
+    :raises TypeError: if 'path' is not a string.
+    :raises ImportError: if 'path' is malformed or names nothing.
+    """
+    if not isinstance(path, str):
+        raise TypeError(f"distgfs: expected a path string, got {path!r}")
+    parts = path.split(".")
+    if not all(part.isidentifier() for part in parts):
+        raise ImportError(f"distgfs: '{path}' is not a valid module.name path")
+    for i in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:i])
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as e:
+            # Try a shorter prefix only if this module itself is missing,
+            # not if it exists but fails to import one of its dependencies.
+            if e.name is not None and (
+                module_name == e.name or module_name.startswith(e.name + ".")
+            ):
+                continue
+            raise
+        return _attribute_path(module, parts[i:], path)
+    return _attribute_path(sys.modules["__main__"], parts, path, in_main=True)
+
+
+def _attribute_path(
+    module: Any, names: List[str], path: str, in_main: bool = False
+) -> Any:
+    """Follow the attributes 'names' from 'module'.
+
+    'path' and 'in_main' (True when no module part of the path could be
+    imported) only shape the error message.
+    """
+    obj = module
+    for name in names:
+        try:
+            obj = getattr(obj, name)
+        except AttributeError as e:
+            where = f"module '{module.__name__}' has no attribute '{'.'.join(names)}'"
+            if in_main and len(names) > 1:
+                where = f"no module '{names[0]}' could be imported, and {where}"
+            raise ImportError(f"distgfs: cannot find '{path}': {where}") from e
+    return obj
+
+
+def resolve_callable(path: str, key: str) -> Callable:
+    """Return the function named by 'path', given as gfsopt_params[key]."""
+    obj = resolve_object_path(path)
+    if not callable(obj):
+        raise TypeError(
+            f"distgfs: {key} '{path}' names a {type(obj).__name__}, not a function"
+        )
+    return obj
+
+
+def _init_controller_side(gfsopt_params: Dict[str, Any]) -> None:
+    """Do the setup that belongs to the controller.
+
+    Calls the controller init function, if one is named, and resolves a
+    named reduce_fun into gfsopt_params.
+    """
+    ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
+    if ctrl_init_fun_name is not None:
+        ctrl_init_fun = resolve_callable(ctrl_init_fun_name, "controller_init_fun_name")
+        ctrl_init_fun(**gfsopt_params.get("controller_init_fun_args", {}))
+    reducefun_name = gfsopt_params.get("reduce_fun_name", None)
+    if reducefun_name is not None:
+        gfsopt_params["reduce_fun"] = resolve_callable(
+            reducefun_name, "reduce_fun_name"
+        )
+        gfsopt_params["reduce_fun_args"] = gfsopt_params.get("reduce_fun_args", {})
+
+
+def _init_worker_side(
+    gfsopt_params: Dict[str, Any], worker: Optional[Any] = None
+) -> Callable:
+    """Return the objective function, found by name or made by the named
+    init function, which receives 'worker'."""
+    objfun_name = gfsopt_params.get("obj_fun_name", None)
+    if objfun_name is not None:
+        return resolve_callable(objfun_name, "obj_fun_name")
+    objfun_init_name = gfsopt_params.get("obj_fun_init_name", None)
+    if objfun_init_name is None:
+        raise RuntimeError("distgfs.gfsinit: objfun is not provided")
+    objfun_init = resolve_callable(objfun_init_name, "obj_fun_init_name")
+    return objfun_init(**(gfsopt_params.get("obj_fun_init_args") or {}), worker=worker)
+
+
 def gfsinit(
     gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
     worker: Optional[int] = None,
     verbose: bool = False,
 ) -> DistGFSOptimizer:
-    objfun = None
-    objfun_module = gfsopt_params.get("obj_fun_module", "__main__")
-    objfun_name = gfsopt_params.get("obj_fun_name", None)
-    if distwq.is_worker:
-        if objfun_name is not None:
-            if objfun_module not in sys.modules:
-                importlib.import_module(objfun_module)
+    """Create the optimizer for this rank and register it in gfsopt_dict.
 
-            objfun = eval(objfun_name, sys.modules[objfun_module].__dict__)
-        else:
-            objfun_init_module = gfsopt_params.get("obj_fun_init_module", "__main__")
-            objfun_init_name = gfsopt_params.get("obj_fun_init_name", None)
-            objfun_init_args = gfsopt_params.get("obj_fun_init_args", None)
-            if objfun_init_name is None:
-                raise RuntimeError("distgfs.gfsinit: objfun is not provided")
-            if objfun_init_module not in sys.modules:
-                importlib.import_module(objfun_init_module)
-            objfun_init = eval(
-                objfun_init_name, sys.modules[objfun_init_module].__dict__
-            )
-            objfun = objfun_init(**objfun_init_args, worker=worker)
-    else:
-        ctrl_init_fun_module = gfsopt_params.get(
-            "controller_init_fun_module", "__main__"
-        )
-        ctrl_init_fun_name = gfsopt_params.get("controller_init_fun_name", None)
-        ctrl_init_fun_args = gfsopt_params.get("controller_init_fun_args", {})
-        if ctrl_init_fun_name is not None:
-            if ctrl_init_fun_module not in sys.modules:
-                importlib.import_module(ctrl_init_fun_module)
-            ctrl_init_fun = eval(
-                ctrl_init_fun_name, sys.modules[ctrl_init_fun_module].__dict__
-            )
-            ctrl_init_fun(**ctrl_init_fun_args)
-        reducefun_module = gfsopt_params.get("reduce_fun_module", "__main__")
-        reducefun_name = gfsopt_params.get("reduce_fun_name", None)
-        reducefun_args = gfsopt_params.get("reduce_fun_args", {})
-        if reducefun_module not in sys.modules:
-            importlib.import_module(reducefun_module)
-        if reducefun_name is not None:
-            reducefun = eval(reducefun_name, sys.modules[reducefun_module].__dict__)
-            gfsopt_params["reduce_fun"] = reducefun
-            gfsopt_params["reduce_fun_args"] = reducefun_args
+    The controller runs the controller init function and resolves
+    reduce_fun_name; a worker resolves the objective function.  A single
+    process is both controller and worker, so it does both, controller
+    part first.
+    """
+    check_removed_module_keys(gfsopt_params)
+    if distwq.is_controller:
+        _init_controller_side(gfsopt_params)
+    objfun = None
+    if distwq.is_worker:
+        objfun = _init_worker_side(gfsopt_params, worker)
     gfsopt_params["obj_fun"] = objfun
     gfsopt = DistGFSOptimizer(**gfsopt_params, verbose=verbose)
     gfsopt_dict[gfsopt.opt_id] = gfsopt
     return gfsopt
 
 
-def _gfsctrl_all_problems(
-    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
-) -> None:
-    iter_count = 0
-    task_ids = []
-    n_tasks = 0
-    while iter_count < gfsopt.n_iter:
-        controller.process()
+def _ordered_problem_ids(problem_ids: Iterable[ProblemId]) -> List[ProblemId]:
+    """Return the distinct problem ids in a reproducible order.
 
-        if (iter_count > 0) and gfsopt.save and (iter_count % gfsopt.save_iter == 0):
-            gfsopt.save_evals()
+    Ids that can be compared with each other are sorted, so that the order
+    does not depend on how a set happens to iterate.  Ids that cannot be
+    compared, such as ints mixed with strings, keep their given order.
+    """
+    ids = list(dict.fromkeys(problem_ids))
+    try:
+        return sorted(ids)
+    except TypeError:
+        return ids
 
-        if len(task_ids) > 0:
-            rets = controller.probe_all_next_results()
-            for ret in rets:
-                task_id, res = ret
-                gfsopt.update_result_value(task_id, res)
-                task_ids.remove(task_id)
-                iter_count += 1
 
-        if (n_tasks < gfsopt.n_iter) and (len(task_ids) == 0):
-            while len(task_ids) < gfsopt.n_max_tasks:
-                vals_dict = {}
-                eval_req_dict = {}
-                for problem_id in gfsopt.problem_ids:
-                    eval_req = gfsopt.optimizer_dict[problem_id].get_next_x()
-                    eval_req_dict[problem_id] = eval_req
-                    vals = list(eval_req.x)
-                    vals_dict[problem_id] = vals
-                task_id = controller.submit_call(
-                    "eval_fun",
-                    module_name="distgfs",
-                    args=(
-                        gfsopt.opt_id,
-                        iter_count,
-                        vals_dict,
-                    ),
+def _next_unit(n_submitted: List[int], n_iter: int, start: int) -> Optional[int]:
+    """Return the first unit at or after 'start', wrapping around, that has
+    fewer than 'n_iter' submitted tasks, or None if every unit is full."""
+    n_units = len(n_submitted)
+    for offset in range(n_units):
+        unit = (start + offset) % n_units
+        if n_submitted[unit] < n_iter:
+            return unit
+    return None
+
+
+def _submit_task(
+    controller: TaskController,
+    gfsopt: "DistGFSOptimizer",
+    problem_ids: Tuple[ProblemId, ...],
+    index: int,
+) -> DistributedFuture:
+    """Submit one evaluation of the problems in 'problem_ids'.
+
+    A new point is requested from the optimizer of each problem, and the
+    request is recorded under the task id of the new future so that
+    update_result_value() can pass the result back.  'index' reaches the
+    objective function as 'pid'.  Returns the future.
+    """
+    eval_reqs = {
+        problem_id: gfsopt.optimizer_dict[problem_id].get_next_x()
+        for problem_id in problem_ids
+    }
+    vals_dict = {problem_id: list(req.x) for problem_id, req in eval_reqs.items()}
+    future = controller.submit(eval_fun, gfsopt.opt_id, index, vals_dict)
+    for problem_id, req in eval_reqs.items():
+        gfsopt.evals[problem_id][future.task_id] = req
+    return future
+
+
+def _finished(in_flight: Dict[DistributedFuture, int]) -> List[DistributedFuture]:
+    """Wait until at least one future in 'in_flight' is done; return the
+    done ones in task id order."""
+    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+    return sorted(done, key=lambda future: future.task_id)
+
+
+def _gfsctrl_loop(controller: TaskController, gfsopt: "DistGFSOptimizer") -> None:
+    """Submit evaluations and collect their results until the search is done.
+
+    The work is divided into units; a unit is the set of problem ids that
+    one task evaluates.  With per_problem_tasks every problem is a unit of
+    its own, and a new task is submitted as soon as a slot is free, taking
+    the units in turn.  Otherwise one unit holds every problem, and tasks
+    are submitted in batches: a new batch starts once every task of the
+    previous one has returned.
+
+    Each unit receives exactly n_iter tasks.  At most n_max_tasks tasks,
+    and at least one, are in flight at a time.  The task's submission
+    index within its unit is passed to the objective function as 'pid'.
+    With saving enabled, a checkpoint is written after every save_iter
+    results; gfsctrl() writes the last one.
+
+    If a task raises, the other results that arrived with it are still
+    passed to the optimizers, and then the task's exception is raised.
+    The failed point is not passed to its optimizer.
+    """
+    problem_ids = _ordered_problem_ids(gfsopt.problem_ids)
+    rolling = gfsopt.per_problem_tasks
+    if rolling:
+        units = [(problem_id,) for problem_id in problem_ids]
+    else:
+        units = [tuple(problem_ids)]
+    n_iter = max(0, gfsopt.n_iter)
+    limit = max(1, gfsopt.n_max_tasks)
+    total = n_iter * len(units)
+
+    n_submitted = [0] * len(units)
+    in_flight: Dict[DistributedFuture, int] = {}  # future -> unit index
+    next_unit = 0
+    n_done = 0
+    last_saved = 0
+
+    while n_done < total:
+        if rolling or not in_flight:
+            while len(in_flight) < limit:
+                unit = _next_unit(n_submitted, n_iter, next_unit)
+                if unit is None:
+                    break
+                future = _submit_task(
+                    controller, gfsopt, units[unit], n_submitted[unit]
                 )
-                task_ids.append(task_id)
-                n_tasks += 1
-                for problem_id in gfsopt.problem_ids:
-                    gfsopt.evals[problem_id][task_id] = eval_req_dict[problem_id]
-
-
-def _gfsctrl_per_problem(
-    controller: distwq.MPIController, gfsopt: "DistGFSOptimizer"
-) -> None:
-    problem_ids = gfsopt.problem_ids
-    n_iter = gfsopt.n_iter
-    n_max_tasks = gfsopt.n_max_tasks
-
-    iter_counts = {pid: 0 for pid in problem_ids}
-    n_submitted = {pid: 0 for pid in problem_ids}
-    task_to_pid: Dict[int, ProblemId] = {}
-    in_flight: List[int] = []
-    pid_cycle = list(problem_ids)
-
-    while any(iter_counts[pid] < n_iter for pid in problem_ids):
-        controller.process()
-
-        total_done = sum(iter_counts.values())
-        if gfsopt.save and total_done > 0 and (total_done % gfsopt.save_iter == 0):
-            gfsopt.save_evals()
-
-        for task_id, res in controller.probe_all_next_results():
-            pid = task_to_pid.pop(task_id)
-            gfsopt.update_result_value(task_id, res)
-            in_flight.remove(task_id)
-            iter_counts[pid] += 1
-
-        for pid in pid_cycle:
-            if n_submitted[pid] >= n_iter:
-                continue
-            if len(in_flight) >= n_max_tasks:
-                break
-            eval_req = gfsopt.optimizer_dict[pid].get_next_x()
-            vals_dict = {pid: list(eval_req.x)}
-            task_id = controller.submit_call(
-                "eval_fun",
-                module_name="distgfs",
-                args=(gfsopt.opt_id, n_submitted[pid], vals_dict),
+                in_flight[future] = unit
+                n_submitted[unit] += 1
+                next_unit = (unit + 1) % len(units)
+        if not in_flight:
+            raise RuntimeError(
+                f"distgfs: no tasks in flight, but only {n_done} of {total} "
+                "results have been received"
             )
-            task_to_pid[task_id] = pid
-            in_flight.append(task_id)
-            gfsopt.evals[pid][task_id] = eval_req
-            n_submitted[pid] += 1
+
+        error = None
+        for future in _finished(in_flight):
+            unit = in_flight.pop(future)
+            try:
+                res = future.result()
+            except Exception as e:
+                if error is None:
+                    error = e
+                continue
+            gfsopt.update_result_value(future.task_id, res, expected_ids=units[unit])
+            n_done += 1
+        if error is not None:
+            raise error
+
+        if gfsopt.save and n_done < total and n_done - last_saved >= gfsopt.save_iter:
+            gfsopt.save_evals()
+            last_saved = n_done
 
 
 def gfsctrl(
-    controller: distwq.MPIController,
+    controller: TaskController,
     gfsopt_params: Dict[str, Union[str, Dict[str, float], Dict[str, List[float]], int]],
     verbose: bool = False,
-) -> None:
-    """Controller for distributed GFS optimization."""
+    n_workers: int = 0,
+) -> "DistGFSOptimizer":
+    """Controller for distributed GFS optimization.
+
+    'n_workers' is the number of workers, or worker groups, of the
+    environment; it sets the default n_max_tasks.  Returns the optimizer.
+
+    If the search raises, for example because the objective function
+    raised, a checkpoint with every result received so far is written
+    (when saving is enabled) and the exception is raised again.
+    """
     logger = logging.getLogger(gfsopt_params["opt_id"])
     if verbose:
         logger.setLevel(logging.INFO)
 
-    n_max_tasks = gfsopt_params.get("n_max_tasks", None)
-    if (n_max_tasks is None) or (n_max_tasks < 1):
-        if gfsopt_params.get("per_problem_tasks", False):
-            _pids = gfsopt_params.get("problem_ids", set())
-            gfsopt_params["n_max_tasks"] = max(distwq.n_workers, len(_pids))
-        else:
-            gfsopt_params["n_max_tasks"] = distwq.n_workers
-
     gfsopt = gfsinit(gfsopt_params)
+    # The default is computed from the optimizer, whose problem ids may
+    # come from a resumed checkpoint rather than from gfsopt_params.
+    if (gfsopt.n_max_tasks is None) or (gfsopt.n_max_tasks < 1):
+        if gfsopt.per_problem_tasks:
+            gfsopt.n_max_tasks = max(n_workers, len(gfsopt.problem_ids))
+        else:
+            gfsopt.n_max_tasks = n_workers
     logger.info(f"Optimizing for {gfsopt.n_iter} iterations...")
-    if gfsopt.per_problem_tasks:
-        _gfsctrl_per_problem(controller, gfsopt)
-    else:
-        _gfsctrl_all_problems(controller, gfsopt)
+    try:
+        _gfsctrl_loop(controller, gfsopt)
+    except BaseException:
+        if gfsopt.save:
+            try:
+                gfsopt.save_evals()
+            except Exception:
+                logger.exception("distgfs: unable to save a checkpoint after an error")
+        raise
     if gfsopt.save:
         gfsopt.save_evals()
     controller.info()
+    return gfsopt
 
 
 def gfswork(
-    worker: distwq.MPIWorker,
+    worker: Any,
     gfsopt_params: Dict[
         str,
         Union[
@@ -1380,8 +1640,25 @@ def gfswork(
     ],
     verbose: bool = False,
 ) -> None:
-    """Worker for distributed GFS optimization."""
+    """Worker init function: set up this process to evaluate the objective.
+
+    distwq calls it, as worker_init, on every process that computes tasks,
+    with the process's server as 'worker'.
+    """
     gfsinit(gfsopt_params, worker=worker, verbose=verbose)
+
+
+def gfsbroker(broker: Any, gfsopt_params: Dict[str, Any], verbose: bool = False) -> Any:
+    """Broker init function that distgfs gives to distwq.
+
+    distwq needs a function defined at module level, which a path such as
+    "mymodule.Model.setup" does not name.  When gfsopt_params names a
+    broker function in 'broker_fun_name', distgfs passes this function
+    instead; it calls the named function with the arguments distwq gives a
+    broker init function.
+    """
+    broker_fun = resolve_callable(gfsopt_params["broker_fun_name"], "broker_fun_name")
+    return broker_fun(broker, gfsopt_params, verbose)
 
 
 def eval_fun(opt_id: str, *args) -> Dict[ProblemId, float]:
@@ -1399,54 +1676,70 @@ def run(
     spawn_executable: Optional[str] = None,
     spawn_args: List[Any] = [],
     verbose: bool = False,
-) -> Tuple[List[Tuple[str, float]], float]:
-    if distwq.is_controller:
-        distwq.run(
-            fun_name="gfsctrl",
-            module_name="distgfs",
-            verbose=verbose,
-            args=(
-                gfsopt_params,
-                verbose,
-            ),
-            max_workers=max_workers,
-            worker_grouping_method="spawn" if spawn_workers else "split",
-            broker_is_worker=True,
-            sequential_spawn=sequential_spawn,
-            spawn_startup_wait=spawn_startup_wait,
-            spawn_executable=spawn_executable,
-            spawn_args=spawn_args,
-            nprocs_per_worker=nprocs_per_worker,
-            collective_mode=collective_mode,
-        )
-        opt_id = gfsopt_params["opt_id"]
-        gfsopt = gfsopt_dict[opt_id]
-        gfsopt.print_best()
-        return gfsopt.get_best()
-    else:
-        if "file_path" in gfsopt_params:
-            del gfsopt_params["file_path"]
-        if "save" in gfsopt_params:
-            del gfsopt_params["save"]
+) -> Optional[Tuple[List[Tuple[str, float]], float]]:
+    """Run a distributed GFS optimization; every rank must call it.
 
-        distwq.run(
-            fun_name="gfswork",
-            module_name="distgfs",
-            broker_is_worker=not spawn_workers,
-            broker_fun_name=gfsopt_params.get("broker_fun_name", None),
-            broker_module_name=gfsopt_params.get("broker_module_name", None),
-            verbose=verbose,
-            args=(
-                gfsopt_params,
-                verbose,
-            ),
-            max_workers=max_workers,
-            worker_grouping_method="spawn" if spawn_workers else "split",
-            sequential_spawn=sequential_spawn,
-            spawn_startup_wait=spawn_startup_wait,
-            spawn_executable=spawn_executable,
-            spawn_args=spawn_args,
-            nprocs_per_worker=nprocs_per_worker,
-            collective_mode=collective_mode,
-        )
-        return None
+    The controller rank runs the search, and the other ranks evaluate the
+    objective function in worker groups of 'nprocs_per_worker' processes,
+    split from the MPI world or, with 'spawn_workers', spawned by one
+    broker rank each.  'max_workers' limits the number of ranks used as
+    workers; ranks left out stay idle.  Without MPI, or on one rank, the
+    controller evaluates the objective itself.
+
+    Returns the best result found, as DistGFSOptimizer.get_best() gives it,
+    on every rank, or None on idle ranks.  If the search raises on the
+    controller, the exception is raised there again, after a checkpoint is
+    written, and the other ranks return None.
+    """
+    check_removed_module_keys(gfsopt_params)
+    broker_fun_name = gfsopt_params.get("broker_fun_name", None)
+    if broker_fun_name is not None:
+        if not spawn_workers:
+            raise ValueError(
+                "distgfs: broker_fun_name needs spawn_workers=True; split worker "
+                "groups have no brokers that only relay calls"
+            )
+        # Checked on every rank, before any MPI call.
+        resolve_callable(broker_fun_name, "broker_fun_name")
+    # Only the controller saves results.
+    worker_params = {
+        key: value
+        for key, value in gfsopt_params.items()
+        if key not in ("file_path", "save")
+    }
+    worker_config = WorkerGroupConfig(
+        grouping_method="spawn" if spawn_workers else "split",
+        nprocs_per_worker=nprocs_per_worker,
+        broker_is_worker=not spawn_workers,
+        collective_mode=collective_mode,
+        sequential_spawn=sequential_spawn,
+        spawn_startup_wait=spawn_startup_wait,
+        spawn_executable=spawn_executable,
+        spawn_args=spawn_args,
+    )
+    config = Config(
+        resources=ResourceConfig(max_workers=max_workers),
+        logging=LoggingConfig(verbose=verbose),
+    )
+    best = None
+    with DistributedEnvironment(
+        config,
+        worker_config,
+        worker_init=gfswork,
+        broker_init=gfsbroker if broker_fun_name is not None else None,
+        init_args=(worker_params, verbose),
+    ) as env:
+        for controller in env.controller_session():
+            gfsopt = gfsctrl(
+                controller, gfsopt_params, verbose, n_workers=env.worker_count
+            )
+            gfsopt.print_best()
+            best = gfsopt.get_best()
+        try:
+            best = env.broadcast(best)
+        except ControllerExitedError:
+            logging.getLogger(gfsopt_params["opt_id"]).warning(
+                "distgfs: the controller stopped with an error; see its output"
+            )
+            best = None
+    return best
