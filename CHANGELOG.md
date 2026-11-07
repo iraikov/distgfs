@@ -1,5 +1,82 @@
 # Changelog
 
+## 2.0.0
+
+distgfs now runs on distwq 2.0. Read "Breaking changes" before upgrading:
+function names and the `pid` passed to the objective have changed.
+
+### Breaking changes
+
+- distwq 2.0 or later and Python 3.11 or later are now required.
+- Functions are named by one path that includes the module, for example
+  `"obj_fun_name": "mymodule.obj_fun"`. This applies to `obj_fun_name`,
+  `obj_fun_init_name`, `controller_init_fun_name`, `reduce_fun_name` and
+  `broker_fun_name`. A name without a module is looked up in `__main__`,
+  as before.
+- The keys `obj_fun_module`, `obj_fun_init_module`,
+  `controller_init_fun_module`, `reduce_fun_module` and
+  `broker_module_name` are removed. Passing one raises `TypeError` that
+  names the path to use instead.
+- A name that cannot be found raises `ImportError` (before, `NameError` or
+  `ModuleNotFoundError`). A name that is not a function raises `TypeError`.
+- Each task passes its own `pid` to the objective: 0 to `n_iter`-1,
+  counted per problem with `per_problem_tasks`. Before, every task in a
+  batch got the same value. Check objectives that derive seeds or file
+  names from `pid`.
+- `broker_fun_name` requires `spawn_workers=True`; otherwise it raises
+  `ValueError`.
+
+### New
+
+- If the objective raises, distgfs writes a checkpoint with every result
+  received so far (when `save` is set), then `run()` raises the same
+  exception. Before, the whole MPI job aborted and the results since the
+  last save were lost.
+- `run()` returns the best result on every rank, not only on the
+  controller. Ranks left idle by `max_workers` return `None`.
+
+### Changed
+
+- A run makes exactly `n_iter` evaluations. Before, with `n_max_tasks`
+  greater than 1, the last batch could run past `n_iter`.
+- With `per_problem_tasks`, problems take turns across refills. Before,
+  each refill started again at the first problem.
+- Problem ids are processed in sorted order. Ids that cannot be compared
+  keep their given order.
+- A checkpoint is written after every `save_iter` new results and at the
+  end. Before, it was written only when the result count was an exact
+  multiple of `save_iter`.
+- In a worker group's results, `None` values are dropped before a result
+  is chosen or `reduce_fun` is called, as with distwq 1.3. If every
+  process returns `None`, `ValueError` is raised.
+- distwq's run statistics are logged at INFO on the `distwq.future`
+  logger instead of printed.
+- `run()` no longer changes the caller's `gfsopt_params` on worker ranks.
+
+### Fixed
+
+- The controller waits for results in a blocking MPI probe instead of
+  polling, and no longer rewrites the checkpoint on every pass.
+- A run without MPI, without `per_problem_tasks` and with `n_max_tasks`
+  unset no longer hangs.
+- In a single process, `controller_init_fun_name` and `reduce_fun_name`
+  are now used. Before, they were ignored.
+- `broker_fun_name` can name a function outside distgfs. Before, no user
+  function could be found. It is called as
+  `fun(broker, gfsopt_params, verbose)`.
+- `obj_fun_init_name` without `obj_fun_init_args` no longer raises
+  `TypeError`.
+- On a resume that takes `problem_ids` from the checkpoint, the default
+  `n_max_tasks` with `per_problem_tasks` counts those problems.
+
+### New checks
+
+- `ValueError` if `save` is set and `save_iter` is less than 1, if
+  `problem_ids` is empty, or if a result does not hold exactly the problem
+  ids of its task.
+- `TypeError` if a task result, or the value returned by `reduce_fun`, is
+  not a dict keyed by problem id.
+
 ## 1.6.0
 
 This is the last release for distwq 1.x. A later release will move distgfs
